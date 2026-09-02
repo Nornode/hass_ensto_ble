@@ -53,6 +53,7 @@ class EnstoConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         
         # Scan for devices that are in pairing mode
         pairing_devices = manager.find_devices_in_pairing_mode()
+        _LOGGER.debug("async_step_user: found %d device(s) in pairing mode", len(pairing_devices))
 
         if not pairing_devices:
             return self.async_abort(
@@ -89,10 +90,12 @@ class EnstoConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._manager.setup()
             
             # Try to connect and authenticate the device
-            try: 
+            try:
                 await self._manager.ensure_connection()
             except Exception as e:
-                _LOGGER.error("Action connect for [%s]: %s", self._mac_address, e)
+                _LOGGER.error(
+                    "Action connect for [%s]: %s: %s", self._mac_address, type(e).__name__, e
+                )
                 return self.async_abort(
                     reason="Connection and authentication with the device failed. Please try again."
                 )

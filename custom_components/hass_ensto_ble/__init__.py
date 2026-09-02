@@ -6,12 +6,14 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.util import dt as dt_util
+from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth import BluetoothCallbackMatcher, BluetoothScanningMode
 
 from .const import (
     DOMAIN,
@@ -285,6 +287,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         
     except Exception as ex:
         _LOGGER.error("Error setting up Ensto BLE: %s", str(ex))
+
+        @callback
+        def _device_seen_again(*_args) -> None:
+            unregister()
+            hass.config_entries.async_schedule_reload(entry.entry_id)
+
+        unregister = bluetooth.async_register_callback(
+            hass,
+            _device_seen_again,
+            BluetoothCallbackMatcher(address=entry.data["mac_address"]),
+            BluetoothScanningMode.PASSIVE,
+        )
+        entry.async_on_unload(unregister)
+
         raise ConfigEntryNotReady from ex
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> bool:

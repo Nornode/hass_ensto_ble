@@ -9,7 +9,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .base_entity import EnstoBaseEntity
 from .const import (
-    SCAN_INTERVAL, FLOOR_SENSOR_TYPE_UUID,
+    SCAN_INTERVAL,
     FLOOR_SENSOR_CONFIG, MODE_MAP, SUPPORTED_MODES_ECO16, SUPPORTED_MODES_ELTE6,
     EXTERNAL_CONTROL_MODES,
 )
@@ -147,11 +147,7 @@ class EnstoFloorSensorSelect(EnstoBaseEntity, SelectEntity):
                new_config[11:13] = params["offset"].to_bytes(2, byteorder='little', signed=True)
                
                # Write configuration to device
-               await self._manager.client.write_gatt_char(
-                   FLOOR_SENSOR_TYPE_UUID,
-                   new_config,
-                   response=True
-               )
+               await self._manager.write_floor_sensor_type(new_config)
 
                # Log successful configuration change
                _LOGGER.debug(
@@ -166,7 +162,7 @@ class EnstoFloorSensorSelect(EnstoBaseEntity, SelectEntity):
     async def async_update(self) -> None:
         """Update floor sensor type."""
         try:
-            result = await self._manager.client.read_gatt_char(FLOOR_SENSOR_TYPE_UUID)
+            result = await self._manager.read_floor_sensor_type()
             if result:
                 # Parse all values
                 sensor_type = result[0]

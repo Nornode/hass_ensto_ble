@@ -1,1 +1,4 @@
 .DS_Store
+
+# Local deploy script contains real HA host/user connection details — never commit
+scripts/deploy.local.sh
