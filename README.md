@@ -9,7 +9,7 @@ Custom component to read and write data from Ensto BLE thermostats.
 
 ## Compatibility
 
-- **Tested environment:** Raspberry Pi 4, Raspberry Pi 5, Home Assistant OS 18.1, Supervisor 2026.6.4, Core 2026.06.2
+- **Tested environment:** Raspberry Pi 4, Raspberry Pi 5, Home Assistant OS 18.2, Supervisor 2026.09.0, Core 2026.8.3
 - **Supported devices:** Ensto ELTE6-BT, ECO10BT, ECO16BT, and EPHE5-BT thermostats (should work with all Ensto thermostats supporting the same BLE Interface Description)
 - **Multi-device support:** Works with multiple thermostats and ESP32 Bluetooth proxies
 - **Installation type:** Developed and tested only with Home Assistant OS. Other installation types are not guaranteed to work.
