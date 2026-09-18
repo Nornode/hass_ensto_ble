@@ -65,7 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
 
     try:
         # Initialize the thermostat manager
-        manager = EnstoThermostatManager(hass, entry.data["mac_address"])
+        manager = EnstoThermostatManager(hass, entry.data["mac_address"], entry.data.get("adapter_source", "auto"))
         
         # Setup scanner and verify connection
         manager.setup()
@@ -121,6 +121,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
                 entity_registry = er.async_get(hass)
                 entity_entry = entity_registry.async_get(entity_id)
                 
+                if not entity_entry:
+                    _LOGGER.error("Entity %s not found in registry", entity_id)
+                    continue
+                    
                 # Get config entry id from entity entry
                 config_entry_id = entity_entry.config_entry_id
                 
