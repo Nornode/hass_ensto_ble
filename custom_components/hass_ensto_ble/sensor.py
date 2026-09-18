@@ -77,7 +77,7 @@ class EnstoBaseSensor(EnstoBaseEntity, SensorEntity):
             )
 
         except Exception as e:
-            _LOGGER.error("Error updating sensor: %s", e)
+            _LOGGER.debug("Error updating sensor: %s", e)
 
 async def async_setup_entry(
     hass: HomeAssistant, # Home Assistant instance
@@ -287,31 +287,49 @@ class EnstoDateTimeSensor(EnstoBaseSensor):
                 ha_utc = dt_util.utcnow()
                 time_diff = abs(ha_utc - device_utc)
                 
-                # Show notification if time difference is more than 1 minute
+                # Auto-sync time if difference is more than 1 minute
                 if time_diff > timedelta(minutes=1):
-                    if not self._alert_shown:
-                        # Get device name for notification
+                    import time
+                    last_sync = getattr(self, "_last_auto_sync", 0)
+                    
+                    # Only attempt auto-sync once every 24 hours per device to prevent write spam if it fails
+                    if time.time() - last_sync > 86400:
+                        self._last_auto_sync = time.time()
                         device_name = self._manager.device_name or "Unknown Device"
+                        _LOGGER.warning("Time Mismatch Detected for %s. Auto-syncing with Home Assistant time directly...", device_name)
                         
-                        await self.hass.services.async_call(
-                            "persistent_notification",
-                            "create",
-                            {
-                                "title": f"Time Mismatch Detected - {device_name}",
-                                "message": (
-                                    f"Device {device_name} ({self._manager.mac_address}) time "
-                                    f"(UTC: {device_utc.strftime('%-d.%-m.%Y %-H:%M:%S')}) "
-                                    f"differs from Home Assistant time "
-                                    f"(UTC: {ha_utc.strftime('%-d.%-m.%Y %-H:%M:%S')}). "
-                                    "Use the Set device time service in Developer tools to synchronize."
-                                ),
-                                "notification_id": f"ensto_time_{self._manager.mac_address}"
-                            }
-                        )
-                        self._alert_shown = True
+                        async def _sync_time():
+                            try:
+                                current_dst = await self._manager.read_daylight_saving()
+                                dst_enabled = current_dst.get('enabled', False) if current_dst else False
+                                ha_tz = dt_util.DEFAULT_TIME_ZONE
+                                
+                                if dst_enabled:
+                                    january_utc = ha_utc.replace(month=1, day=15)
+                                    january_local = january_utc.astimezone(ha_tz)
+                                    tz_offset = int(january_local.utcoffset().total_seconds() / 60)
+                                else:
+                                    local_now = ha_utc.astimezone(ha_tz)
+                                    tz_offset = int(local_now.utcoffset().total_seconds() / 60)
+                                    
+                                success = await self._manager.write_date_and_time(
+                                    ha_utc.year, ha_utc.month, ha_utc.day, 
+                                    ha_utc.hour, ha_utc.minute, ha_utc.second
+                                )
+                                if success:
+                                    await self._manager.write_daylight_saving(
+                                        enabled=dst_enabled, winter_to_summer=60, 
+                                        summer_to_winter=60, timezone_offset=tz_offset
+                                    )
+                                    _LOGGER.info("Successfully auto-synced time for %s", self._manager.mac_address)
+                            except Exception as sync_e:
+                                _LOGGER.error("Failed to auto-sync time for %s: %s", self._manager.mac_address, sync_e)
+                        
+                        # Run in background to avoid blocking sensor update loop
+                        self.hass.async_create_task(_sync_time())
                 else:
-                    # Reset alert flag if times are in sync
-                    self._alert_shown = False
+                    # Reset throttle if times are in sync
+                    self._last_auto_sync = 0
                         
         except Exception as e:
             _LOGGER.error("Error updating datetime: %s", e)
