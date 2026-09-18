@@ -1,6 +1,7 @@
 """Support for Ensto BLE devices."""
 import logging
 import asyncio
+import time
 from typing import Optional
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -51,12 +52,16 @@ _LOGGER = logging.getLogger(__name__)
 class EnstoThermostatManager:
     """Manager for Ensto BLE thermostats."""
 
-    def __init__(self, hass: HomeAssistant, mac_address: str) -> None:
+    def __init__(self, hass: HomeAssistant, mac_address: str, adapter_source: str = "auto") -> None:
+        self.adapter_source = adapter_source
         """Initialize the manager."""
         self.hass = hass
         self.mac_address = mac_address
         self.client: Optional[BleakClient] = None
         self._connect_lock = asyncio.Lock()
+        self._available = True
+        self._unavailable_until = 0
+        self._consecutive_failures = 0
         self.scanner = None
         self.storage_manager = EnstoStorageManager(hass)
         self.model_number = None
@@ -91,15 +96,20 @@ class EnstoThermostatManager:
         """Initialize the connection."""
         await self.connect()
 
+    async def disconnect(self) -> None:
+        """Safely disconnect and clear client."""
+        if self.client:
+            try:
+                if self.client.is_connected:
+                    await self.client.disconnect()
+            except Exception as e:
+                _LOGGER.debug("Error during disconnect: %s", e)
+            finally:
+                self.client = None
+
     async def cleanup(self) -> None:
         """Clean up the connection."""
-        try:
-            if self.client and self.client.is_connected:
-                await self.client.disconnect()
-        except Exception as e:
-            _LOGGER.debug("Error during cleanup disconnect: %s", e)
-        finally:
-            self.client = None
+        await self.disconnect()
 
     async def connect(self) -> None:
         """Establish connection to the device."""
@@ -109,7 +119,56 @@ class EnstoThermostatManager:
                     return
 
                 _LOGGER.debug("Finding device %s", self.mac_address)
-                device = bluetooth.async_ble_device_from_address(self.hass, self.mac_address)
+                
+                # Get all available adapters that can see this device
+                from homeassistant.components.bluetooth import async_scanner_devices_by_address
+                devices_iter = async_scanner_devices_by_address(self.hass, self.mac_address, connectable=True)
+                devices_list = list(devices_iter) if devices_iter else []
+                
+                device = None
+                if devices_list:
+                    _LOGGER.info("Found %d adapters for %s:", len(devices_list), self.mac_address)
+                    for d in devices_list:
+                        rssi = getattr(d.advertisement, 'rssi', 'unknown') if hasattr(d, 'advertisement') else 'unknown'
+                        details = getattr(d.ble_device, 'details', None)
+                        if isinstance(details, dict):
+                            src = details.get('source', details.get('path', str(details)))
+                        else:
+                            src = getattr(details, 'source', str(type(details)))
+                        _LOGGER.info(" - Available Adapter: %s (RSSI: %s)", src, rssi)
+                        
+                    # Sort devices by RSSI (highest/best signal first)
+                    devices_list.sort(key=lambda d: getattr(d.advertisement, 'rssi', -100) if hasattr(d, 'advertisement') else -100, reverse=True)
+                    
+                    if getattr(self, 'adapter_source', 'auto') != 'auto':
+                        import time
+                        fallback_active = getattr(self, '_fallback_active_until', 0) > time.time()
+                        
+                        if fallback_active:
+                            _LOGGER.warning("Preferred adapter %s is in fallback mode. Auto-selecting best RSSI adapter.", self.adapter_source)
+                        else:
+                            for d in devices_list:
+                                details = getattr(d.ble_device, 'details', None)
+                                if isinstance(details, dict):
+                                    src = details.get('source', details.get('path', str(details)))
+                                else:
+                                    src = getattr(details, 'source', str(type(details)))
+                                if src == self.adapter_source:
+                                    device = d.ble_device
+                                    _LOGGER.info("Forced Bluetooth adapter %s for %s based on user config", src, self.mac_address)
+                                    break
+                    
+                    if not device:
+                        device = devices_list[0].ble_device
+                        best_rssi = getattr(devices_list[0].advertisement, 'rssi', 'unknown') if hasattr(devices_list[0], 'advertisement') else 'unknown'
+                        _LOGGER.info("Selected best available adapter for %s based on RSSI (%s dBm)", self.mac_address, best_rssi)
+
+                if not device:
+                    device = bluetooth.async_ble_device_from_address(self.hass, self.mac_address)
+                    if device:
+                        adapter_source = getattr(device.details, 'source', str(type(device.details))) if hasattr(device, 'details') else "Unknown"
+                        _LOGGER.info("Fallback selected Bluetooth adapter for %s is: %s", self.mac_address, adapter_source)
+                
                 if not device:
                     raise Exception(f"Device {self.mac_address} not found")
 
@@ -120,8 +179,23 @@ class EnstoThermostatManager:
 
                 # always pair to set encryption
                 _LOGGER.debug("Pairing with device %s", self.mac_address)
-                await self.client.pair()
-                _LOGGER.debug("Paired device %s", self.mac_address)
+                try:
+                    await self.client.pair()
+                    _LOGGER.debug("Paired device %s", self.mac_address)
+                except Exception as e:
+                    if "Authentication" in str(e) or "AuthenticationFailed" in str(e):
+                        _LOGGER.warning("Authentication failed (%s). Attempting to unpair and retry...", e)
+                        try:
+                            await self.client.unpair()
+                            import asyncio
+                            await asyncio.sleep(2)
+                            await self.client.pair()
+                            _LOGGER.debug("Successfully paired after unpairing: %s", self.mac_address)
+                        except Exception as unpair_e:
+                            _LOGGER.error("Failed to unpair/repair: %s", unpair_e)
+                            raise e
+                    else:
+                        raise e
 
                 # Check storage first
                 stored_id = await self.read_device_info()
@@ -151,10 +225,15 @@ class EnstoThermostatManager:
                 self.device_name = await self.read_device_name()
                 
                 _LOGGER.info("Successfully verified Factory Reset ID and read model number")
+                
+                # Connection fully succeeded, reset availability
+                self._available = True
+                self._consecutive_failures = 0
+                self._unavailable_until = 0
 
             except Exception as e:
                 _LOGGER.error("Failed to connect: %s", str(e))
-                self.client = None
+                await self.disconnect()
                 raise
             finally:
                 self._connect_lock.release()
@@ -163,8 +242,76 @@ class EnstoThermostatManager:
 
     async def ensure_connection(self) -> None:
         """Ensure that we have a connection to the device."""
+        if not self._available and time.time() < self._unavailable_until:
+            _LOGGER.debug("Device %s is in cooldown, skipping connection", self.mac_address)
+            raise Exception("Device unavailable (cooldown)")
+
         if not self.client or not self.client.is_connected:
             await self.connect()
+
+    async def _ble_read(self, uuid: str, retries: int = 2) -> Optional[bytes]:
+        """Helper to handle connection checks, retries, and error logging for BLE reads."""
+        for attempt in range(retries + 1):
+            try:
+                await self.ensure_connection()
+                data = await self.client.read_gatt_char(uuid)
+                _LOGGER.debug("BLE read from %s: %s", uuid, data.hex() if data else "None")
+                
+                # Reset failures on success
+                if not self._available:
+                    self._available = True
+                self._consecutive_failures = 0
+                
+                return data
+            except Exception as e:
+                log_level = logging.DEBUG if attempt < retries else logging.WARNING
+                _LOGGER.log(log_level, "BLE read failed for %s (attempt %d/%d): %s", uuid, attempt + 1, retries + 1, e)
+                await self.disconnect()
+                if attempt < retries:
+                    await asyncio.sleep(1 * (attempt + 1))
+                else:
+                    self._consecutive_failures += 1
+                    if getattr(self, 'adapter_source', 'auto') != 'auto' and getattr(self, '_fallback_active_until', 0) < time.time() and self._consecutive_failures == 2:
+                        self._fallback_active_until = time.time() + 600
+                        self._consecutive_failures = 0
+                        _LOGGER.warning("Preferred adapter %s failed. Falling back to best available adapter for 10 minutes.", self.adapter_source)
+                    elif self._consecutive_failures >= 3:
+                        self._available = False
+                        self._unavailable_until = time.time() + 120
+                        _LOGGER.warning("Device %s marked unavailable for 120s due to consecutive failures.", self.mac_address)
+        return None
+
+    async def _ble_write(self, uuid: str, data: bytes, retries: int = 2, response: bool = True) -> bool:
+        """Helper to handle connection checks, retries, and error logging for BLE writes."""
+        for attempt in range(retries + 1):
+            try:
+                await self.ensure_connection()
+                _LOGGER.debug("BLE write to %s: %s", uuid, data.hex() if data else "None")
+                await self.client.write_gatt_char(uuid, data, response=response)
+                
+                # Reset failures on success
+                if not self._available:
+                    self._available = True
+                self._consecutive_failures = 0
+                
+                return True
+            except Exception as e:
+                log_level = logging.DEBUG if attempt < retries else logging.WARNING
+                _LOGGER.log(log_level, "BLE write failed for %s (attempt %d/%d): %s", uuid, attempt + 1, retries + 1, e)
+                await self.disconnect()
+                if attempt < retries:
+                    await asyncio.sleep(1 * (attempt + 1))
+                else:
+                    self._consecutive_failures += 1
+                    if getattr(self, 'adapter_source', 'auto') != 'auto' and getattr(self, '_fallback_active_until', 0) < time.time() and self._consecutive_failures == 2:
+                        self._fallback_active_until = time.time() + 600
+                        self._consecutive_failures = 0
+                        _LOGGER.warning("Preferred adapter %s failed. Falling back to best available adapter for 10 minutes.", self.adapter_source)
+                    elif self._consecutive_failures >= 3:
+                        self._available = False
+                        self._unavailable_until = time.time() + 120
+                        _LOGGER.warning("Device %s marked unavailable for 120s due to consecutive failures.", self.mac_address)
+        return False
 
     async def write_device_info(self, device_address: str, factory_reset_id: int) -> None:
         """Write device info to Home Assistant storage."""
@@ -212,20 +359,27 @@ class EnstoThermostatManager:
 
     async def read_factory_reset_id(self) -> Optional[int]:
         """Read Factory Reset ID from the BLE device."""
-        try:
-            data = await self.client.read_gatt_char(FACTORY_RESET_ID_UUID)
-            factory_reset_id = int.from_bytes(data[:4], byteorder="little")
-            return factory_reset_id
-        except Exception as e:
-            raise Exception("Failed to read factory reset ID: %s", e)
+        import asyncio
+        for attempt in range(4):
+            try:
+                data = await self.client.read_gatt_char(FACTORY_RESET_ID_UUID)
+                _LOGGER.debug("BLE read from %s: %s", FACTORY_RESET_ID_UUID, data.hex() if data else "None")
+                return int.from_bytes(data[:4], byteorder="little")
+            except Exception as e:
+                if attempt < 3:
+                    _LOGGER.warning("GATT read for factory reset failed (attempt %d/4). Waiting for ESPHome GATT resolution... Error: %s", attempt + 1, e)
+                    await asyncio.sleep(2.5)
+                else:
+                    raise Exception(f"Failed to read factory reset ID after 4 attempts: {e}")
 
     async def write_factory_reset_id(self, factory_reset_id: int) -> None:
         """Write the Factory Reset ID to the BLE device."""
         try:
             id_bytes = factory_reset_id.to_bytes(4, byteorder="little")
-            await self.client.write_gatt_char(FACTORY_RESET_ID_UUID, id_bytes)
+            _LOGGER.debug("BLE write to %s: %s", FACTORY_RESET_ID_UUID, id_bytes.hex())
+            await self.client.write_gatt_char(FACTORY_RESET_ID_UUID, id_bytes, response=True)
         except Exception as e:
-            raise Exception("Failed to write factory reset ID: %s", e)
+            raise Exception(f"Failed to write factory reset ID: {e}")
 
     async def read_split_characteristic(self, characteristic_uuid: str) -> bytes:
         """
@@ -267,9 +421,9 @@ class EnstoThermostatManager:
             return bytes(combined_data).rstrip(b'\x00')
             
         except BleakError as e:
-            _LOGGER.error("Error reading characteristic: %s", e)
+            _LOGGER.warning("Error reading characteristic: %s", e)
             # Connection might be dead, clear it
-            self.client = None
+            await self.disconnect()
             raise
 
     def parse_real_time_indication(self, data: bytes) -> dict:
@@ -361,23 +515,11 @@ class EnstoThermostatManager:
     async def read_model_number(self) -> Optional[str]:
         """Read model number via GATT characteristic."""
         try:
-            if not self.client or not self.client.is_connected:
-                return None
-                
-            # Read the raw bytes
-            model_number_raw = await self.client.read_gatt_char(MODEL_NUMBER_UUID)
-
-            # Decode using UTF-8
-            model_number = model_number_raw.decode('utf-8')
-            return model_number
-            
-        except BleakError as e:
-            _LOGGER.error("BLE error reading model number: %s", e)
-            self.client = None
-            return None
-            
+            data = await self.client.read_gatt_char(MODEL_NUMBER_UUID)
+            _LOGGER.debug("BLE read from %s: %s", MODEL_NUMBER_UUID, data.hex() if data else "None")
+            return data.decode('utf-8')
         except Exception as e:
-            _LOGGER.error("Failed to read model number: %s", e)
+            _LOGGER.warning("Failed to parse model number: %s", e)
             return None
 
     async def set_heating_mode(self, mode: int) -> None:
@@ -396,13 +538,11 @@ class EnstoThermostatManager:
 
     async def read_boost(self) -> dict:
         """Read boost configuration from device."""
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(BOOST_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(BOOST_UUID)
+        try:
 
             # Parse data
             enabled = bool(data[0])  # First byte is enable flag
@@ -430,22 +570,13 @@ class EnstoThermostatManager:
                 'remaining_minutes': remaining_minutes
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading boost config: %s", e)
-            self.client = None
-            return None
-            
         except Exception as e:
-            _LOGGER.error("Failed to read boost config: %s", e)
+            _LOGGER.warning("Failed to parse boost config: %s", e)
             return None
 
     async def write_boost(self, enabled: bool, offset_degrees: float, offset_percentage: int, duration_minutes: int) -> bool:
         """Write boost configuration to device."""
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
             # Validate input values
             if not (-20 <= offset_degrees <= 20):
                 raise ValueError("Temperature offset must be between -20 and 20 degrees")
@@ -476,27 +607,20 @@ class EnstoThermostatManager:
             data[6:8] = (0).to_bytes(2, byteorder='little')
             
             # Write to device
-            await self.client.write_gatt_char(BOOST_UUID, data, response=True)
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing boost config: %s", e)
-            self.client = None
-            return None
-            
         except Exception as e:
-            _LOGGER.error("Failed to write boost config: %s", e)
+            _LOGGER.warning("Failed to prepare boost config data: %s", e)
             return False
+
+        return await self._ble_write(BOOST_UUID, data)
+
 
     async def read_heating_mode(self) -> dict:
         """Read heating mode configuration from device."""
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(HEATING_MODE_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(HEATING_MODE_UUID)
+        try:
 
             # Get mode number from first byte
             mode_number = data[0]
@@ -507,23 +631,14 @@ class EnstoThermostatManager:
                 'mode_name': mode_name
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading heating mode: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read heating mode: %s", e)
+            _LOGGER.warning("Failed to parse heating mode: %s", e)
             return None
 
     async def write_heating_mode(self, mode: int) -> bool:
         """Write heating mode configuration to device."""
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
-            # Validate input mode
+    # Validate input mode
             if mode not in MODE_MAP:
                 raise ValueError(
                     "Invalid mode. Must be: "
@@ -535,27 +650,20 @@ class EnstoThermostatManager:
             data = bytes([mode])
             
             # Write to device
-            await self.client.write_gatt_char(HEATING_MODE_UUID, data, response=True)
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing heating mode: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to write heating mode: %s", e)
+            _LOGGER.warning("Failed to prepare heating mode data: %s", e)
             return False
+
+        return await self._ble_write(HEATING_MODE_UUID, data)
+
 
     async def read_adaptive_temp_control(self) -> dict:
         """Read adaptive temperature control setting from device."""
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(ADAPTIVE_TEMPERATURE_CONTROL_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(ADAPTIVE_TEMPERATURE_CONTROL_UUID)
+        try:
 
             # Parse first byte as boolean
             enabled = bool(data[0])
@@ -564,37 +672,23 @@ class EnstoThermostatManager:
                 'enabled': enabled
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading adaptive temperature control: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read adaptive temperature control: %s", e)
+            _LOGGER.warning("Failed to parse adaptive temperature control: %s", e)
             return None
 
     async def write_adaptive_temp_control(self, enabled: bool) -> bool:
         """Write adaptive temperature control setting to device."""
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
-            # Create single byte data
+    # Create single byte data
             data = bytes([1 if enabled else 0])
             
             # Write to device
-            await self.client.write_gatt_char(ADAPTIVE_TEMPERATURE_CONTROL_UUID, data, response=True)
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing adaptive temperature control: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to write adaptive temperature control: %s", e)
+            _LOGGER.warning("Failed to prepare adaptive temperature control data: %s", e)
             return False
+
+        return await self._ble_write(ADAPTIVE_TEMPERATURE_CONTROL_UUID, data)
+
 
     async def read_device_name(self) -> Optional[str]:
         """
@@ -604,14 +698,13 @@ class EnstoThermostatManager:
             str - Device name if successful, None if failed or device is unnamed
         """
         try:
-            if not self.client or not self.client.is_connected:
+            data = await self.client.read_gatt_char(DEVICE_NAME_UUID)
+            _LOGGER.debug("BLE read from %s: %s", DEVICE_NAME_UUID, data.hex() if data else "None")
+            if not data:
                 return None
-                
-            # Read the raw bytes
-            raw_data = await self.client.read_gatt_char(DEVICE_NAME_UUID)
             
             # Skip first byte and strip null bytes
-            name_bytes = raw_data[1:].split(b'\x00')[0]
+            name_bytes = data[1:].split(b'\x00')[0]
             
             # If no actual name data, return None
             if not name_bytes:
@@ -620,14 +713,8 @@ class EnstoThermostatManager:
             # Decode using UTF-8 to handle Nordic characters
             device_name = name_bytes.decode('utf-8')
             return device_name
-
-        except BleakError as e:
-            _LOGGER.error("BLE error reading device name: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read device name: %s", e)
+            _LOGGER.warning("Failed to parse device name: %s", e)
             return None
 
     async def write_split_characteristic(self, characteristic_uuid: str, data: bytes) -> bool:
@@ -682,9 +769,9 @@ class EnstoThermostatManager:
             return True
             
         except BleakError as e:
-            _LOGGER.error("Error writing characteristic: %s", e)
+            _LOGGER.warning("Error writing characteristic: %s", e)
             # Connection might be dead, clear it
-            self.client = None
+            await self.disconnect()
             raise
 
     async def read_date_and_time(self) -> dict:
@@ -700,13 +787,11 @@ class EnstoThermostatManager:
                 second (int): Second (0-59)
             None: If read fails
         """
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(DATE_AND_TIME_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(DATE_AND_TIME_UUID)
+        try:
 
             # Ensure input is the correct length
             if len(data) != 7:
@@ -730,13 +815,8 @@ class EnstoThermostatManager:
                 "second": second
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading date and time from device: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read date and time from device: %s", e)
+            _LOGGER.warning("Failed to parse date and time from device: %s", e)
             return None
 
     async def write_date_and_time(self, year: int, month: int, day: int, hour: int, minute: int, second: int) -> bool:
@@ -762,11 +842,7 @@ class EnstoThermostatManager:
             of the device's timezone settings.
         """
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
-            # Validate input values
+    # Validate input values
             if not (0 <= year <= 9999):
                 _LOGGER.error("Invalid UTC year: %s", year)
                 return False
@@ -812,17 +888,12 @@ class EnstoThermostatManager:
             ])
 
             # Write to device
-            await self.client.write_gatt_char(DATE_AND_TIME_UUID, data, response=True)
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing UTC time to device: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to write UTC time to device: %s", e)
+            _LOGGER.warning("Failed to prepare UTC time to device data: %s", e)
             return False
+
+        return await self._ble_write(DATE_AND_TIME_UUID, data)
+
 
     async def read_daylight_saving(self) -> dict:
         """Read daylight saving configuration from device.
@@ -835,13 +906,11 @@ class EnstoThermostatManager:
                 timezone_offset (int): Base timezone offset in minutes from UTC
             None: If read fails
         """
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(DAYLIGHT_SAVING_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(DAYLIGHT_SAVING_UUID)
+        try:
 
             # Parse data
             enabled = bool(data[0])
@@ -859,13 +928,8 @@ class EnstoThermostatManager:
                 'timezone_offset': timezone_offset
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading daylight saving config: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read daylight saving config: %s", e)
+            _LOGGER.warning("Failed to parse daylight saving config: %s", e)
             return None
 
     async def write_daylight_saving(
@@ -893,10 +957,6 @@ class EnstoThermostatManager:
             - Device adds the DST offset automatically when enabled
         """
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
             data = bytearray(8)
             data[0] = 1 if enabled else 0  # Enable/disable flag
             data[1] = 0  # Reserved byte
@@ -909,24 +969,11 @@ class EnstoThermostatManager:
             
             # Timezone offset (UTC+2 = 120 minutes for Finland)
             data[6:8] = timezone_offset.to_bytes(2, byteorder='little', signed=True)
-
-            await self.client.write_gatt_char(DAYLIGHT_SAVING_UUID, data, response=True)
-            _LOGGER.debug(
-                "Wrote DST config to %s for %s: enabled=%s, timezone=%d min",
-                self.device_name or "Unknown Device", 
-                self.mac_address,
-                enabled, timezone_offset
-            )
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing daylight saving config: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to write daylight saving config: %s", e)
+            _LOGGER.warning("Failed to prepare daylight saving config data: %s", e)
             return False
+
+        return await self._ble_write(DAYLIGHT_SAVING_UUID, data)
 
     async def read_floor_limits(self) -> Optional[dict]:
         """Read floor temperature limits from device.
@@ -937,23 +984,18 @@ class EnstoThermostatManager:
                 high_value: Max floor temp in °C (range 13-50)
             None if read fails
         """
+        data = await self._ble_read(FLOOR_LIMITS_UUID)
+        if not data:
+            return None
+
         try:
-            data = await self.client.read_gatt_char(FLOOR_LIMITS_UUID)
-            if not data or len(data) != 4:
-                return None
-                   
             return {
                 'low_value': int.from_bytes(data[0:2], byteorder='little') / 100,
                 'high_value': int.from_bytes(data[2:4], byteorder='little') / 100
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading floor limits: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read floor limits: %s", e)
+            _LOGGER.warning("Failed to parse floor limits: %s", e)
             return None
 
     async def write_floor_limits(self, low_value: float, high_value: float) -> bool:
@@ -972,51 +1014,39 @@ class EnstoThermostatManager:
             - Min absolute value: 5°C
             - Max absolute value: 50°C
         """
-        try:
-            # Input validation
-            if not (5 <= low_value <= 42):
-                _LOGGER.error("Min floor temp must be between 5-42°C")
-                return False
-                  
-            if not (13 <= high_value <= 50):
-                _LOGGER.error("Max floor temp must be between 13-50°C")
-                return False
-                  
-            if high_value - low_value < 8:
-                _LOGGER.error("Min must be at least 8°C lower than max")
-                return False
-                   
-            data = bytearray(4)
-            low_raw = int(low_value * 100)
-            high_raw = int(high_value * 100)
-            data[0:2] = low_raw.to_bytes(2, byteorder='little')
-            data[2:4] = high_raw.to_bytes(2, byteorder='little')
-               
-            await self.client.write_gatt_char(FLOOR_LIMITS_UUID, data)
+        # Input validation
+        if not (5 <= low_value <= 42):
+            _LOGGER.error("Min floor temp must be between 5-42°C")
+            return False
+        if not (13 <= high_value <= 50):
+            _LOGGER.error("Max floor temp must be between 13-50°C")
+            return False
+        if high_value - low_value < 8:
+            _LOGGER.error("Min must be at least 8°C lower than max")
+            return False
+
+        data = bytearray(4)
+        low_raw = int(low_value * 100)
+        high_raw = int(high_value * 100)
+        data[0:2] = low_raw.to_bytes(2, byteorder='little')
+        data[2:4] = high_raw.to_bytes(2, byteorder='little')
+
+        result = await self._ble_write(FLOOR_LIMITS_UUID, bytes(data), response=False)
+        if result:
             _LOGGER.debug(
                 "Floor limits written successfully: min=%.1f °C, max=%.1f °C",
                 low_value,
                 high_value
             )
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing floor limits: %s", e)
-            self.client = None
-            return None
-        
-        except Exception as e:
-            _LOGGER.error("Failed to write floor limits: %s", e)
-            return False
+        return result
 
     async def read_room_sensor_calibration(self) -> dict:
         """Read room sensor calibration value."""
+        data = await self._ble_read(CALIBRATION_VALUE_FOR_ROOM_TEMPERATURE_UUID)
+        if not data:
+            return None
+
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
-                
-            data = await self.client.read_gatt_char(CALIBRATION_VALUE_FOR_ROOM_TEMPERATURE_UUID)
             raw_value = int.from_bytes(data[0:2], byteorder='little', signed=True)
             calibration_value = round(raw_value / 10, 1)
             
@@ -1024,79 +1054,46 @@ class EnstoThermostatManager:
                 'calibration_value': calibration_value
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading room sensor calibration: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read room sensor calibration: %s", e)
+            _LOGGER.warning("Failed to parse room sensor calibration: %s", e)
             return None
 
     async def write_room_sensor_calibration(self, value: float) -> bool:
         """Write room sensor calibration value."""
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-                
-            if not (-5.0 <= value <= 5.0):
-                raise ValueError("Calibration value must be between -5.0 and +5.0 °C")
-                
-            raw_value = int(value * 10)
-            data = raw_value.to_bytes(2, byteorder='little', signed=True)
-            
-            await self.client.write_gatt_char(
-                CALIBRATION_VALUE_FOR_ROOM_TEMPERATURE_UUID,
-                data,
-                response=True
-            )
-            
-            return True
-                
-        except BleakError as e:
-            _LOGGER.error("BLE error writing room sensor calibration: %s", e)
-            self.client = None
-            return None
-        
-        except Exception as e:
-            _LOGGER.error("Failed to write room sensor calibration: %s", e)
+        if not (-5.0 <= value <= 5.0):
+            _LOGGER.error("Calibration value must be between -5.0 and +5.0 °C")
             return False
+
+        raw_value = int(value * 10)
+        data = raw_value.to_bytes(2, byteorder='little', signed=True)
+        return await self._ble_write(CALIBRATION_VALUE_FOR_ROOM_TEMPERATURE_UUID, data)
 
     async def read_software_revision(self) -> Optional[str]:
         """Read software revision string."""
+        data = await self._ble_read(SOFTWARE_REVISION_UUID)
+        if not data:
+            return None
+
         try:
-            if not self.client or not self.client.is_connected:
-                return None
-            data = await self.client.read_gatt_char(SOFTWARE_REVISION_UUID)
             # Parse format: app;ble;bootloader
             return data.decode('utf-8')
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading software revision: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to read software revision: %s", e)
+            _LOGGER.warning("Failed to parse software revision: %s", e)
             return None
 
     async def read_hardware_revision(self) -> Optional[str]:
         """Read hardware revision."""
+        data = await self._ble_read(HARDWARE_REVISION_UUID)
+        if not data:
+            return None
+
         try:
-            if not self.client or not self.client.is_connected:
-                return None
-            data = await self.client.read_gatt_char(HARDWARE_REVISION_UUID)
             hw_version = int.from_bytes(data[0:4], byteorder='little')
             return str(hw_version)
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading hardware revision: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to read hardware revision: %s", e)
+            _LOGGER.warning("Failed to parse hardware revision: %s", e)
             return None
 
     async def read_heating_power(self) -> dict:
@@ -1107,13 +1104,11 @@ class EnstoThermostatManager:
                 heating_power (int): Heating power in Watts (range 0-9999)
         """
 
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(HEATING_POWER_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(HEATING_POWER_UUID)
+        try:
             
             heating_power = int.from_bytes(data[0:2], byteorder='little')
 
@@ -1121,13 +1116,8 @@ class EnstoThermostatManager:
                 'heating_power': heating_power
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading custom heating power value: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to read custom heating power value: %s", e)
+            _LOGGER.warning("Failed to parse custom heating power value: %s", e)
             return None
 
     async def write_heating_power(self, value: int) -> bool:
@@ -1145,24 +1135,13 @@ class EnstoThermostatManager:
             return False
 
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-                
             data = value.to_bytes(2, byteorder='little')
-            
-            await self.client.write_gatt_char(HEATING_POWER_UUID, data, response=True)
-
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing custom heating power value: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to write custom heating power value: %s", e)
+            _LOGGER.warning("Failed to prepare custom heating power value data: %s", e)
             return False
+
+        return await self._ble_write(HEATING_POWER_UUID, data)
+
 
     async def read_floor_area(self) -> dict:
         """Read custom floor area configuration from device.
@@ -1172,13 +1151,11 @@ class EnstoThermostatManager:
                 floor_area (int): Floor area in square meters (m²)
         """
             
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(FLOOR_AREA_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(FLOOR_AREA_UUID)
+        try:
             
             floor_area = int.from_bytes(data[0:2], byteorder='little')
 
@@ -1186,13 +1163,8 @@ class EnstoThermostatManager:
                 'floor_area': floor_area
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading custom floor area value: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to read custom floor area value: %s", e)
+            _LOGGER.warning("Failed to parse custom floor area value: %s", e)
             return None
 
     async def write_floor_area(self, value: int) -> bool:
@@ -1213,24 +1185,13 @@ class EnstoThermostatManager:
             return False
 
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-                
             data = value.to_bytes(2, byteorder='little')
-            
-            await self.client.write_gatt_char(FLOOR_AREA_UUID, data, response=True)
-
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing custom floor area value: %s", e)
-            self.client = None
-            return None
-        
         except Exception as e:
-            _LOGGER.error("Failed to write custom floor area value: %s", e)
+            _LOGGER.warning("Failed to prepare custom floor area value data: %s", e)
             return False
+
+        return await self._ble_write(FLOOR_AREA_UUID, data)
+
 
     async def read_energy_unit(self) -> dict:
         """Read energy unit configuration from device.
@@ -1251,13 +1212,11 @@ class EnstoThermostatManager:
             }
         """
 
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
+        data = await self._ble_read(ENERGY_UNIT_UUID)
+        if not data:
+            return None
 
-            # Read raw data from device
-            data = await self.client.read_gatt_char(ENERGY_UNIT_UUID)
+        try:
             
             # Parse currency (first byte)
             currency = data[0]
@@ -1273,23 +1232,14 @@ class EnstoThermostatManager:
                 'price': price
             }
         
-        except BleakError as e:
-            _LOGGER.error("BLE error reading energy unit configuratio: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to read energy unit configuration: %s", e)
+            _LOGGER.warning("Failed to parse energy unit configuration: %s", e)
             return None
 
     async def write_energy_unit(self, currency: int, price: float) -> bool:
         """Write energy unit configuration to device."""
 
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-            
             if not (0 <= price <= 655.35):
                 _LOGGER.error("Price must be between 0 and 655.35: %s", price)
                 return False
@@ -1304,23 +1254,12 @@ class EnstoThermostatManager:
             data[2:4] = price_raw.to_bytes(2, byteorder='little')
 
             # Write to device
-            await self.client.write_gatt_char(ENERGY_UNIT_UUID, data, response=True)
-            
-            _LOGGER.debug(
-                "Wrote energy unit config for %s (%s) - Currency: %s (%d), Price: %.2f",
-                self.device_name, self.mac_address,
-                CURRENCY_MAP.get(currency, "Unknown"), currency, price
-            )
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing energy unit configuration: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Failed to write energy unit configuration: %s", e)
+            _LOGGER.warning("Failed to prepare energy unit configuration data: %s", e)
             return False
+
+        return await self._ble_write(ENERGY_UNIT_UUID, data)
+
 
     async def read_power_consumption(self) -> dict:
         """Read real time power consumption data.
@@ -1340,7 +1279,7 @@ class EnstoThermostatManager:
                 return None
             
             if len(data) < 4:
-                _LOGGER.error("Data too short, expected at least 4 bytes for header")
+                _LOGGER.warning("Data too short, expected at least 4 bytes for header")
                 return None
 
             # Parse header timestamp
@@ -1375,12 +1314,12 @@ class EnstoThermostatManager:
             }
 
         except BleakError as e:
-            _LOGGER.error("BLE error reading power consumption: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error reading power consumption: %s", e)
+            await self.disconnect()
             return None
 
         except Exception as e:
-            _LOGGER.error("Error reading power consumption: %s", e)
+            _LOGGER.warning("Error reading power consumption: %s", e)
             return None
 
     async def read_monitoring_data(self) -> Optional[dict]:
@@ -1507,23 +1446,21 @@ class EnstoThermostatManager:
             return result
 
         except BleakError as e:
-            _LOGGER.error("BLE error reading monitoring data: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error reading monitoring data: %s", e)
+            await self.disconnect()
             return None
         
         except Exception as e:
-            _LOGGER.error("Error reading monitoring data: %s", e)
+            _LOGGER.warning("Error reading monitoring data: %s", e)
             return None
 
     async def read_vacation_time(self) -> Optional[dict]:
         """Read vacation time configuration from device."""
-        try:
-            data = await self.client.read_gatt_char(VACATION_TIME_UUID)
-            
-            if not data or len(data) < 15:
-                _LOGGER.error("Invalid vacation time data length")
-                return None
+        data = await self._ble_read(VACATION_TIME_UUID)
+        if not data:
+            return None
 
+        try:
             # Parse wall clock time from device
             from_year = 2000 + data[0]
             from_month = data[1]
@@ -1568,121 +1505,8 @@ class EnstoThermostatManager:
                 'raw_data': data.hex()  # Include raw data for logging
             }
 
-        except BleakError as e:
-            _LOGGER.error("BLE error reading vacation time: %s", e)
-            self.client = None
-            return None
-
         except Exception as e:
-            _LOGGER.error("Error reading vacation time: %s", e)
-            return None
-
-    async def write_vacation_time(
-       self,
-       time_from: datetime,
-       time_to: datetime,
-       offset_temperature: float,
-       offset_percentage: int,
-       enabled: bool
-    ) -> bool:
-       """Write vacation time configuration to device.
-       
-       Args:
-           time_from (datetime): Start time of vacation (UTC)
-           time_to (datetime): End time of vacation (UTC)
-           offset_temperature (float): Temperature offset in degrees (-20 to +20)
-           offset_percentage (int): Percentage offset (-100% to 100%)
-           enabled (bool): Enable/disable vacation mode
-       """
-       try:
-           # Read current settings to preserve active state
-           current_settings = await self.read_vacation_time()
-           current_active = False
-           if current_settings and 'active' in current_settings:
-               current_active = current_settings['active']
-               
-           # Validate input ranges
-           if not (-20 <= offset_temperature <= 20):
-               raise ValueError("Temperature offset must be between -20 and +20")
-               
-           if not (-100 <= offset_percentage <= 100):
-               raise ValueError("Percentage offset must be between -100 and 100")
-
-           # Convert UTC times to local (wall clock) times
-           local_from = dt_util.as_local(time_from)
-           local_to = dt_util.as_local(time_to)
-           
-           # Format for device (remove timezone info)
-           from_year = local_from.year - 2000
-           if not (0 <= from_year <= 255):
-               raise ValueError(f"Start year must be between 2000-2255, got {local_from.year}")
-               
-           to_year = local_to.year - 2000
-           if not (0 <= to_year <= 255):
-               raise ValueError(f"End year must be between 2000-2255, got {local_to.year}")
-
-           # Create data packet
-           data = bytearray(15)
-           
-           # Time from (local wall clock)
-           data[0] = from_year
-           data[1] = local_from.month
-           data[2] = local_from.day
-           data[3] = local_from.hour
-           data[4] = local_from.minute
-           
-           # Time to (local wall clock)
-           data[5] = to_year
-           data[6] = local_to.month
-           data[7] = local_to.day
-           data[8] = local_to.hour
-           data[9] = local_to.minute
-
-           # Temperature offset
-           temp_raw = int(offset_temperature * 100)
-           data[10:12] = temp_raw.to_bytes(2, byteorder='little', signed=True)
-           
-           # Percentage and enabled
-           # Convert percentage offset to signed int8
-           data[12] = offset_percentage.to_bytes(1, byteorder='little', signed=True)[0]
-           data[13] = 1 if enabled else 0  # User-set enabled state - byte 13
-           data[14] = 1 if current_active else 0  # Preserve current active state - byte 14 (read only)
-           
-           await self.client.write_gatt_char(VACATION_TIME_UUID, data)
-           return True
-
-       except BleakError as e:
-           _LOGGER.error("BLE error writing vacation time: %s", e)
-           self.client = None
-           return None
-
-       except Exception as e:
-           _LOGGER.error("Error writing vacation time: %s", e)
-           return False
-
-    async def read_calendar_mode(self) -> Optional[dict]:
-        """Read calendar mode setting from device.
-        
-        Returns:
-            dict with key 'enabled' (bool) or None if failed
-        """
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
-
-            # Read single byte from device
-            data = await self.client.read_gatt_char(CALENDAR_MODE_UUID)
-            enabled = bool(data[0])
-
-            return {'enabled': enabled}
-
-        except BleakError as e:
-            _LOGGER.error("BLE error reading calendar mode: %s", e)
-            self.client = None
-            return None
-        except Exception as e:
-            _LOGGER.error("Failed to read calendar mode: %s", e)
+            _LOGGER.warning("Failed to parse vacation time: %s", e)
             return None
 
     async def write_calendar_mode(self, enabled: bool) -> bool:
@@ -1694,28 +1518,12 @@ class EnstoThermostatManager:
         Returns:
             True if successful, False otherwise
         """
-        try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-
-            # Create single byte data
-            data = bytes([1 if enabled else 0])
-            
-            # Write to device
-            await self.client.write_gatt_char(CALENDAR_MODE_UUID, data, response=True)
-            
+        data = bytes([1 if enabled else 0])
+        result = await self._ble_write(CALENDAR_MODE_UUID, data)
+        if result:
             _LOGGER.debug("Action [Calendar Mode %s] for [%s]: success",
                          "Enable" if enabled else "Disable", self.mac_address)
-            return True
-
-        except BleakError as e:
-            _LOGGER.error("BLE error writing calendar mode: %s", e)
-            self.client = None
-            return False
-        except Exception as e:
-            _LOGGER.error("Failed to write calendar mode: %s", e)
-            return False
+        return result
 
     async def read_calendar_day(self, day: int) -> Optional[dict]:
         """Read calendar day programs from device.
@@ -1727,10 +1535,7 @@ class EnstoThermostatManager:
             dict with 'day' and 'programs' list, or None if failed
         """
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
-                
+            await self.ensure_connection()
             if not (1 <= day <= 7):
                 _LOGGER.error("Invalid day number: %s (must be 1-7)", day)
                 return None
@@ -1794,11 +1599,11 @@ class EnstoThermostatManager:
             }
 
         except BleakError as e:
-            _LOGGER.error("BLE error reading calendar day: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error reading calendar day: %s", e)
+            await self.disconnect()
             return None
         except Exception as e:
-            _LOGGER.error("Failed to read calendar day: %s", e)
+            _LOGGER.warning("Failed to read calendar day: %s", e)
             return None
 
     async def write_calendar_day(self, day: int, programs: list) -> bool:
@@ -1814,10 +1619,7 @@ class EnstoThermostatManager:
             True if successful, False otherwise
         """
         try:
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
-                
+            await self.ensure_connection()
             if not (1 <= day <= 7):
                 _LOGGER.error("Invalid day number: %s (must be 1-7)", day)
                 return False
@@ -1875,11 +1677,11 @@ class EnstoThermostatManager:
             return True
 
         except BleakError as e:
-            _LOGGER.error("BLE error writing calendar day: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error writing calendar day: %s", e)
+            await self.disconnect()
             return False
         except Exception as e:
-            _LOGGER.error("Failed to write calendar day: %s", e)
+            _LOGGER.warning("Failed to write calendar day: %s", e)
             return False
 
     async def read_force_control(self) -> Optional[dict]:
@@ -1903,10 +1705,6 @@ class EnstoThermostatManager:
         """
         try:
             await self.ensure_connection()
-
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return None
 
             data = await self.client.read_gatt_char(FORCE_CONTROL_UUID)
             device_name = self.device_name or "Unknown Device"
@@ -1964,12 +1762,12 @@ class EnstoThermostatManager:
             return None
 
         except BleakError as e:
-            _LOGGER.error("BLE error reading force control: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error reading force control: %s", e)
+            await self.disconnect()
             return None
 
         except Exception as e:
-            _LOGGER.error("Failed to read force control: %s", e)
+            _LOGGER.warning("Failed to read force control: %s", e)
             return None
 
     async def write_force_control(self, mode: int, temperature: float, temperature_offset: float) -> bool:
@@ -1986,10 +1784,6 @@ class EnstoThermostatManager:
         """
         try:
             await self.ensure_connection()
-
-            if not self.client or not self.client.is_connected:
-                _LOGGER.error("Device not connected.")
-                return False
 
             device_name = self.device_name or "Unknown Device"
 
@@ -2039,10 +1833,10 @@ class EnstoThermostatManager:
             return True
 
         except BleakError as e:
-            _LOGGER.error("BLE error writing force control: %s", e)
-            self.client = None
+            _LOGGER.warning("BLE error writing force control: %s", e)
+            await self.disconnect()
             return False
 
         except Exception as e:
-            _LOGGER.error("Failed to write force control: %s", e)
+            _LOGGER.warning("Failed to write force control: %s", e)
             return False

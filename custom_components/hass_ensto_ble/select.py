@@ -194,7 +194,7 @@ class EnstoFloorSensorSelect(EnstoBaseEntity, SelectEntity):
                         break
                 
         except Exception as e:
-            _LOGGER.error("Error updating floor sensor type: %s", e)
+            _LOGGER.debug("Error updating floor sensor type: %s", e)
 
 class EnstoExternalControlModeSelect(EnstoBaseEntity, SelectEntity):
     """Select entity for external control mode.

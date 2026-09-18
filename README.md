@@ -11,7 +11,7 @@ Custom component to read and write data from Ensto BLE thermostats.
 
 - **Tested environment:** Raspberry Pi 4, Raspberry Pi 5, Home Assistant OS 18.1, Supervisor 2026.6.4, Core 2026.06.2
 - **Supported devices:** Ensto ELTE6-BT, ECO10BT, ECO16BT, and EPHE5-BT thermostats (should work with all Ensto thermostats supporting the same BLE Interface Description)
-- **Multi-device support:** Works with multiple thermostats and ESP32 Bluetooth proxies
+- **Multi-device support:** Works with multiple thermostats and ESP32 Bluetooth proxies with automatic signal-strength selection and adapter failover
 - **Installation type:** Developed and tested only with Home Assistant OS. Other installation types are not guaranteed to work.
 
 > **Note:** This is a hobby project under active development.
@@ -33,8 +33,9 @@ Custom component to read and write data from Ensto BLE thermostats.
 1. Put the thermostat in pairing mode (hold BLE reset button >0.5 seconds until blue LED blinks)
 2. Navigate to **Settings → Devices & services → Add Integration**
 3. Search for "Hass Ensto BLE"
-4. Select your thermostat from the discovered devices list
-5. Choose currency for energy calculations (stored in thermostat memory)
+4. Select your thermostat from the discovered devices list (the integration searches for up to 60 seconds to detect pairing advertisements)
+5. Select a **Bluetooth Adapter** or proxy (or choose **Auto-Select (Best Signal)** to automatically route traffic through the adapter with the highest RSSI)
+6. Choose currency for energy calculations (stored in thermostat memory)
 
 ### Adding Thermostat to Dashboard
 
@@ -97,17 +98,25 @@ The device automatically converts between UTC and local time based on this setti
 
 Synchronize the thermostat's internal clock with Home Assistant.
 
-Home Assistant shows a notification if the device time differs by more than one minute.
-
-1. Navigate to **Developer Tools → Actions**
-2. Select service `hass_ensto_ble.set_device_time`
-3. Select your thermostat's DateTime entity as target
-4. Click **Perform action**
-5. Verify the **Date and time** sensor shows the correct local time
-
-The notification disappears automatically once synchronized.
+- **Automatic synchronization:** The integration automatically monitors the thermostat's clock against Home Assistant UTC time. If the device drifts by more than 1 minute, the integration automatically synchronizes the date, time, and daylight saving offsets in the background (rate-limited to once every 24 hours).
+- **Manual synchronization:** You can also trigger an immediate synchronization at any time:
+  1. Navigate to **Developer Tools → Actions**
+  2. Select service `hass_ensto_ble.set_device_time`
+  3. Select your thermostat's DateTime entity as target
+  4. Click **Perform action**
+  5. Verify the **Date and time** sensor shows the correct local time
 
 > **Note:** Time is handled internally in UTC to ensure consistent operation across time zones.
+
+### Bluetooth Adapter Selection & Fault Tolerance
+
+Ensure dependable connectivity in setups with multiple Bluetooth adapters or ESPHome Bluetooth proxies.
+
+- **Adapter Binding or Auto-Selection:** During initial setup, choose a specific Bluetooth adapter/proxy or allow the integration to automatically select the adapter with the strongest signal (highest RSSI).
+- **Automatic Failover:** If the preferred adapter experiences consecutive connection failures, the integration temporarily falls back to the best available alternative adapter for 10 minutes before re-testing.
+- **ESPHome Proxy Tolerance:** Added retry logic for initial GATT characteristic discovery, allowing ESPHome Bluetooth proxies ample time to complete service resolution.
+- **Circuit Breaker & Backoff:** Transient disconnects trigger incremental retries. After repeated failures, the device enters a brief 2-minute cooldown rather than exhausting Bluetooth bandwidth with rapid reconnections.
+- **Authentication Recovery:** If pairing state becomes desynchronized (`AuthenticationFailed`), the integration automatically unpairs and re-initiates pairing.
 
 ### Floor Sensor Type
 
@@ -287,7 +296,7 @@ Some users need additional pairing via terminal to establish a Bluetooth connect
 Incorrect internal time (e.g., years in the future or past) is commonly caused by a weak or dead RTC backup battery.
 
 1. Replace the CR1225 battery (see device installation manual)
-2. Use the `set_device_time` service in Developer Tools to synchronize the time
+2. Use the `set_device_time` service in Developer Tools to synchronize the time immediately (or wait for the integration's automatic background synchronization to take effect)
 
 ## Known Limitations
 
