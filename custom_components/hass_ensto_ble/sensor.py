@@ -1,3 +1,4 @@
+import time
 """Support for Ensto BLE sensors."""
 import logging
 from datetime import datetime, timedelta
@@ -289,7 +290,6 @@ class EnstoDateTimeSensor(EnstoBaseSensor):
                 
                 # Auto-sync time if difference is more than 1 minute
                 if time_diff > timedelta(minutes=1):
-                    import time
                     last_sync = getattr(self, "_last_auto_sync", 0)
                     
                     # Only attempt auto-sync once every 24 hours per device to prevent write spam if it fails

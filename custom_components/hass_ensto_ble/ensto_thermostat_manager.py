@@ -141,7 +141,6 @@ class EnstoThermostatManager:
                     devices_list.sort(key=lambda d: getattr(d.advertisement, 'rssi', -100) if hasattr(d, 'advertisement') else -100, reverse=True)
                     
                     if getattr(self, 'adapter_source', 'auto') != 'auto':
-                        import time
                         fallback_active = getattr(self, '_fallback_active_until', 0) > time.time()
                         
                         if fallback_active:
@@ -187,7 +186,6 @@ class EnstoThermostatManager:
                         _LOGGER.warning("Authentication failed (%s). Attempting to unpair and retry...", e)
                         try:
                             await self.client.unpair()
-                            import asyncio
                             await asyncio.sleep(2)
                             await self.client.pair()
                             _LOGGER.debug("Successfully paired after unpairing: %s", self.mac_address)
@@ -359,7 +357,6 @@ class EnstoThermostatManager:
 
     async def read_factory_reset_id(self) -> Optional[int]:
         """Read Factory Reset ID from the BLE device."""
-        import asyncio
         for attempt in range(4):
             try:
                 data = await self.client.read_gatt_char(FACTORY_RESET_ID_UUID)
@@ -1507,6 +1504,88 @@ class EnstoThermostatManager:
 
         except Exception as e:
             _LOGGER.warning("Failed to parse vacation time: %s", e)
+            return None
+
+    async def write_vacation_time(
+       self,
+       time_from: datetime,
+       time_to: datetime,
+       offset_temperature: float,
+       offset_percentage: int,
+       enabled: bool
+    ) -> bool:
+       """Write vacation time configuration to device."""
+       try:
+           # Read current settings to preserve active state
+           current_settings = await self.read_vacation_time()
+           current_active = False
+           if current_settings and 'active' in current_settings:
+               current_active = current_settings['active']
+               
+           # Validate input ranges
+           if not (-20 <= offset_temperature <= 20):
+               raise ValueError("Temperature offset must be between -20 and +20")
+               
+           if not (-100 <= offset_percentage <= 100):
+               raise ValueError("Percentage offset must be between -100 and 100")
+
+           # Convert UTC times to local (wall clock) times
+           local_from = dt_util.as_local(time_from)
+           local_to = dt_util.as_local(time_to)
+           
+           # Format for device (remove timezone info)
+           from_year = local_from.year - 2000
+           if not (0 <= from_year <= 255):
+               raise ValueError(f"Start year must be between 2000-2255, got {local_from.year}")
+               
+           to_year = local_to.year - 2000
+           if not (0 <= to_year <= 255):
+               raise ValueError(f"End year must be between 2000-2255, got {local_to.year}")
+
+           # Create data packet
+           data = bytearray(15)
+           
+           # Time from (local wall clock)
+           data[0] = from_year
+           data[1] = local_from.month
+           data[2] = local_from.day
+           data[3] = local_from.hour
+           data[4] = local_from.minute
+           
+           # Time to (local wall clock)
+           data[5] = to_year
+           data[6] = local_to.month
+           data[7] = local_to.day
+           data[8] = local_to.hour
+           data[9] = local_to.minute
+
+           # Temperature offset
+           temp_raw = int(offset_temperature * 100)
+           data[10:12] = temp_raw.to_bytes(2, byteorder='little', signed=True)
+           
+           # Percentage and enabled
+           data[12] = offset_percentage.to_bytes(1, byteorder='little', signed=True)[0]
+           data[13] = 1 if enabled else 0
+           data[14] = 1 if current_active else 0
+           
+           await self.client.write_gatt_char(VACATION_TIME_UUID, data)
+           return True
+           
+       except Exception as e:
+           _LOGGER.error("Error writing vacation time: %s", e)
+           return False
+
+    async def read_calendar_mode(self) -> dict | None:
+        """Read calendar mode setting from device."""
+        try:
+            data = await self._ble_read(CALENDAR_MODE_UUID)
+            if data and len(data) >= 1:
+                return {
+                    'enabled': data[0] == 0x01
+                }
+            return None
+        except Exception as e:
+            _LOGGER.warning("Failed to read calendar mode: %s", e)
             return None
 
     async def write_calendar_mode(self, enabled: bool) -> bool:
