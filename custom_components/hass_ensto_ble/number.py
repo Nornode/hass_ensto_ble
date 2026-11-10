@@ -125,7 +125,7 @@ class EnstoBoostOffsetNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is available in all heating modes except Power mode (mode 4).
         """
-        return self._current_mode != 4
+        return super().available and self._current_mode != 4
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the boost temperature offset."""
@@ -184,7 +184,7 @@ class EnstoBoostPowerOffsetNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is only available in Power heating mode (mode 4).
         """
-        return self._current_mode == 4
+        return super().available and self._current_mode == 4
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the boost power offset percentage.
@@ -258,7 +258,7 @@ class EnstoFloorLimitNumber(EnstoBaseEntity, NumberEntity):
         
         The entity is only available in combination heating mode (mode 3).
         """
-        return self._current_mode == 3  # Only show Floor Min / Max in "Combination" heating mode
+        return super().available and self._current_mode == 3  # Only show Floor Min / Max in "Combination" heating mode
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
@@ -471,7 +471,7 @@ class EnstoVacationTempOffsetNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is available in all heating modes except Power mode (mode 4).
         """
-        return self._current_mode != 4
+        return super().available and self._current_mode != 4
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the vacation temperature offset value.
@@ -531,7 +531,7 @@ class EnstoVacationPowerOffsetNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is only available in Power heating mode (mode 4).
         """
-        return self._current_mode == 4
+        return super().available and self._current_mode == 4
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the vacation power offset percentage.
@@ -596,7 +596,7 @@ class EnstoExternalControlTemperatureNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is only available when external control mode is Temperature (mode 5).
         """
-        return self._current_mode == 5
+        return super().available and self._current_mode == 5
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the external control temperature."""
@@ -653,7 +653,7 @@ class EnstoExternalControlOffsetNumber(EnstoBaseEntity, NumberEntity):
         
         Entity is only available when external control mode is Temperature change (mode 6).
         """
-        return self._current_mode == 6
+        return super().available and self._current_mode == 6
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the external control temperature offset."""
