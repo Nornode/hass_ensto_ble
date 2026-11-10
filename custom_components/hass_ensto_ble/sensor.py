@@ -1,4 +1,3 @@
-import time
 """Support for Ensto BLE sensors."""
 import logging
 from datetime import datetime, timedelta
@@ -24,7 +23,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers import entity_registry
 
-from .const import REAL_TIME_INDICATION_UUID, SCAN_INTERVAL
+from .const import SCAN_INTERVAL
 from .base_entity import EnstoBaseEntity
 
 from . import EnstoConfigEntry
@@ -32,6 +31,9 @@ from . import EnstoConfigEntry
 _LOGGER = logging.getLogger(__name__)
 
 UNIT_MINUTES = "min"
+
+# The device updates its history once an hour; read it this long after the full hour
+HISTORY_READ_DELAY = timedelta(minutes=5)
 
 class EnstoBaseSensor(EnstoBaseEntity, SensorEntity):
     """Base class for Ensto sensors."""
@@ -78,7 +80,7 @@ class EnstoBaseSensor(EnstoBaseEntity, SensorEntity):
             )
 
         except Exception as e:
-            _LOGGER.debug("Error updating sensor: %s", e)
+            _LOGGER.error("Error updating sensor: %s", e)
 
 async def async_setup_entry(
     hass: HomeAssistant, # Home Assistant instance
@@ -89,12 +91,10 @@ async def async_setup_entry(
     manager = entry.runtime_data
     
     # Check floor sensor availability
-    data = await manager.read_split_characteristic(REAL_TIME_INDICATION_UUID)
+    parsed_data = await manager.get_real_time_coordinator().get_real_time_data()
     sensors = []
     
-    if data:
-        parsed_data = manager.parse_real_time_indication(data)
-        
+    if parsed_data is not None:
         # Add sensors
         sensors.extend([
             EnstoTemperatureSensor(manager, "room"),
@@ -233,8 +233,6 @@ class EnstoDateTimeSensor(EnstoBaseSensor):
         # Create a unique ID for the sensor using MAC address
         self._attr_unique_id = f"{dr.format_mac(self._manager.mac_address)}_datetime"
         self._attr_native_value = None
-        # Track if alert is currently shown
-        self._alert_shown = False
 
     async def async_added_to_hass(self) -> None:
             """Subscribe to updates."""
@@ -266,7 +264,7 @@ class EnstoDateTimeSensor(EnstoBaseSensor):
         
         The device internally operates in UTC time and handles DST/timezone conversions
         based on its own settings. We read UTC time from device and compare it with
-        HA's UTC time to detect mismatches.
+        HA's UTC time, and synchronize the device clock if they differ.
         """
         try:
             # Get current date and time from the device (in UTC)
@@ -288,49 +286,11 @@ class EnstoDateTimeSensor(EnstoBaseSensor):
                 ha_utc = dt_util.utcnow()
                 time_diff = abs(ha_utc - device_utc)
                 
-                # Auto-sync time if difference is more than 1 minute
+                # Synchronize device clock if time difference is more than 1 minute
                 if time_diff > timedelta(minutes=1):
-                    last_sync = getattr(self, "_last_auto_sync", 0)
-                    
-                    # Only attempt auto-sync once every 24 hours per device to prevent write spam if it fails
-                    if time.time() - last_sync > 86400:
-                        self._last_auto_sync = time.time()
-                        device_name = self._manager.device_name or "Unknown Device"
-                        _LOGGER.warning("Time Mismatch Detected for %s. Auto-syncing with Home Assistant time directly...", device_name)
-                        
-                        async def _sync_time():
-                            try:
-                                current_dst = await self._manager.read_daylight_saving()
-                                dst_enabled = current_dst.get('enabled', False) if current_dst else False
-                                ha_tz = dt_util.DEFAULT_TIME_ZONE
-                                
-                                if dst_enabled:
-                                    january_utc = ha_utc.replace(month=1, day=15)
-                                    january_local = january_utc.astimezone(ha_tz)
-                                    tz_offset = int(january_local.utcoffset().total_seconds() / 60)
-                                else:
-                                    local_now = ha_utc.astimezone(ha_tz)
-                                    tz_offset = int(local_now.utcoffset().total_seconds() / 60)
-                                    
-                                success = await self._manager.write_date_and_time(
-                                    ha_utc.year, ha_utc.month, ha_utc.day, 
-                                    ha_utc.hour, ha_utc.minute, ha_utc.second
-                                )
-                                if success:
-                                    await self._manager.write_daylight_saving(
-                                        enabled=dst_enabled, winter_to_summer=60, 
-                                        summer_to_winter=60, timezone_offset=tz_offset
-                                    )
-                                    _LOGGER.info("Successfully auto-synced time for %s", self._manager.mac_address)
-                            except Exception as sync_e:
-                                _LOGGER.error("Failed to auto-sync time for %s: %s", self._manager.mac_address, sync_e)
-                        
-                        # Run in background to avoid blocking sensor update loop
-                        self.hass.async_create_task(_sync_time())
-                else:
-                    # Reset throttle if times are in sync
-                    self._last_auto_sync = 0
-                        
+                    if await self._manager.sync_date_and_time(time_diff.total_seconds()):
+                        self._attr_native_value = dt_util.as_local(ha_utc).strftime("%-d.%-m.%Y %-H:%M")
+
         except Exception as e:
             _LOGGER.error("Error updating datetime: %s", e)
 
@@ -355,6 +315,8 @@ class EnstoPowerConsumptionSensor(EnstoBaseEntity, SensorEntity):
             "last_12_months": [],
             "temperature_history": []
         }
+        # Hour of the last successful history read, None until the first read
+        self._history_hour = None
 
     async def async_update(self) -> None:
         """Fetch new state data for the sensor."""
@@ -375,12 +337,15 @@ class EnstoPowerConsumptionSensor(EnstoBaseEntity, SensorEntity):
                     for m in result['measurements']
                 ]
 
-            # Get historical monitoring data
-            monitoring_data = await self._manager.read_monitoring_data()
-            if monitoring_data:
-                self._attr_extra_state_attributes["last_7_days"] = monitoring_data['daily_power']
-                self._attr_extra_state_attributes["last_12_months"] = monitoring_data['monthly_power']
-                self._attr_extra_state_attributes["temperature_history"] = monitoring_data['temperature_history']
+            # Historical monitoring data is large, so read it only once an hour
+            history_hour = (dt_util.now() - HISTORY_READ_DELAY).replace(minute=0, second=0, microsecond=0)
+            if history_hour != self._history_hour:
+                monitoring_data = await self._manager.read_monitoring_data()
+                if monitoring_data:
+                    self._history_hour = history_hour
+                    self._attr_extra_state_attributes["last_7_days"] = monitoring_data['daily_power']
+                    self._attr_extra_state_attributes["last_12_months"] = monitoring_data['monthly_power']
+                    self._attr_extra_state_attributes["temperature_history"] = monitoring_data['temperature_history']
 
         except Exception as e:
             _LOGGER.error("Error updating power consumption sensor: %s", e)
@@ -424,8 +389,8 @@ class EnstoCurrentPowerSensor(EnstoBaseEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Return if sensor is available when heating power is configured."""
-        return self._heating_power is not None and self._heating_power > 0
+        """Return if sensor is available when heating power is configured and device is available."""
+        return super().available and self._heating_power is not None and self._heating_power > 0
 
     async def async_update(self) -> None:
         """Update the current power consumption value."""
@@ -436,9 +401,13 @@ class EnstoCurrentPowerSensor(EnstoBaseEntity, SensorEntity):
         
         # Calculate power if heating power is configured
         if self._heating_power and self._heating_power > 0:
-            data = await self._manager.read_split_characteristic(REAL_TIME_INDICATION_UUID)
-            if data:
-                parsed_data = self._manager.parse_real_time_indication(data)
+            try:
+                parsed_data = await self._manager.get_real_time_coordinator().get_real_time_data()
+            except Exception as e:
+                _LOGGER.error("Error updating current power sensor: %s", e)
+                parsed_data = None
+
+            if parsed_data:
                 relay_active = parsed_data.get("relay_active", False)
                 self._attr_native_value = self._heating_power if relay_active else 0
             else:
