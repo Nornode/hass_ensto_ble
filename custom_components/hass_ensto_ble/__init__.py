@@ -4,14 +4,11 @@ from __future__ import annotations
 import logging
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.util import dt as dt_util
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError, ServiceValidationError
 
 from .const import (
     DOMAIN,
@@ -30,7 +27,6 @@ type EnstoConfigEntry = ConfigEntry[EnstoThermostatManager]
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.SELECT, Platform.NUMBER, Platform.DATETIME]
 
 # Set services
-SERVICE_SET_TIME = "set_device_time"
 SERVICE_GET_CALENDAR_DAY = "get_calendar_day"
 SERVICE_SET_CALENDAR_DAY = "set_calendar_day"
 
@@ -63,6 +59,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         )
         _LOGGER.debug("Migrated config entry %s to have unique_id", entry.data["mac_address"])
 
+    manager = None
     try:
         # Initialize the thermostat manager
         manager = EnstoThermostatManager(hass, entry.data["mac_address"], entry.data.get("adapter_source", "auto"))
@@ -78,114 +75,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         manager.sw_version = await manager.read_software_revision()
         manager.hw_version = await manager.read_hardware_revision()
 
+        # Sensors are created from the first real-time data, so retry setup until it can be read
+        if await manager.get_real_time_coordinator().get_real_time_data() is None:
+            raise Exception("Could not read real-time data")
+
         # Update config entry title with current info
         title = f"{manager.model_number or 'Unknown Model'} {manager.device_name or entry.data['mac_address']}"
         hass.config_entries.async_update_entry(entry, title=title)
 
-        # Initialize device currency from config flow
+        # Initialize device currency from config flow, keeping the price stored on the device
         try:
             config_currency = entry.data.get(CONF_CURRENCY, DEFAULT_CURRENCY)
-            success = await manager.write_energy_unit(config_currency, 0.0)
-            
-            if not success:
-                _LOGGER.warning("Failed to set device currency")
-                
+            current = await manager.read_energy_unit()
+
+            if current is None:
+                _LOGGER.warning("Could not read energy unit, device currency not initialized")
+            elif current['currency_code'] != config_currency:
+                success = await manager.write_energy_unit(config_currency, current['price'])
+                if not success:
+                    _LOGGER.warning("Failed to set device currency")
+
         except Exception as e:
             _LOGGER.warning("Failed to initialize device currency: %s", e)
-
-        async def set_device_time(call: ServiceCall) -> None:
-            """Set device time to match Home Assistant time."""
-
-            # Get current UTC time from Home Assistant
-            utc_now = dt_util.utcnow()
-            
-            # Extract the target entity from service call data
-            target_entity = call.data.get("entity_id")
-                
-            if not target_entity:
-                _LOGGER.error("No target entity specified")
-                return
-
-            # Handle both single entity and multiple entities if given by user
-            if isinstance(target_entity, list):
-                entity_ids = target_entity
-            else:
-                entity_ids = [target_entity]
-
-            # Debug timezone info once (applies to all devices)
-            _LOGGER.debug("Action [Set Device Time]: setting UTC time %s", utc_now.strftime('%Y-%m-%d %H:%M:%S'))
-
-            # Process each entity
-            for entity_id in entity_ids:
-                # Get the entity registry entry for the target
-                entity_registry = er.async_get(hass)
-                entity_entry = entity_registry.async_get(entity_id)
-                
-                if not entity_entry:
-                    _LOGGER.error("Entity %s not found in registry", entity_id)
-                    continue
-                    
-                # Get config entry id from entity entry
-                config_entry_id = entity_entry.config_entry_id
-                
-                # Get the correct thermostat manager instance for this device
-                config_entry = hass.config_entries.async_get_entry(config_entry_id)
-                manager = config_entry.runtime_data
-                
-                # Read current DST settings from the device
-                current_dst_settings = await manager.read_daylight_saving()
-                dst_enabled = current_dst_settings.get('enabled', False) if current_dst_settings else False
-
-                # Calculate timezone offset based on DST setting (same logic as DST switch)
-                ha_tz = dt_util.DEFAULT_TIME_ZONE
-                
-                if dst_enabled:
-                    # DST enabled: use base timezone offset (standard time)
-                    january_utc = utc_now.replace(month=1, day=15)
-                    january_local = january_utc.astimezone(ha_tz)
-                    tz_offset = int(january_local.utcoffset().total_seconds() / 60)
-
-                    _LOGGER.debug("Action [Set Device Time] for [%s]: DST enabled, using base offset %d min", 
-                                manager.mac_address, tz_offset)
-                else:
-                    # DST disabled: use current offset (includes DST if active)
-                    local_now = utc_now.astimezone(ha_tz)
-                    tz_offset = int(local_now.utcoffset().total_seconds() / 60)
-                    _LOGGER.debug("Action [Set Device Time] for [%s]: DST disabled, using current offset %d min", 
-                                manager.mac_address, tz_offset)
-
-                # Write UTC time to the device
-                if await manager.write_date_and_time(
-                    utc_now.year,
-                    utc_now.month,
-                    utc_now.day,
-                    utc_now.hour,
-                    utc_now.minute,
-                    utc_now.second
-                ):
-                    # Update timezone and DST settings while preserving DST state
-                    await manager.write_daylight_saving(
-                        enabled=dst_enabled,
-                        winter_to_summer=60,
-                        summer_to_winter=60,
-                        timezone_offset=tz_offset
-                    )
-                    
-                    _LOGGER.debug("Action [Set Device Time] for [%s]: successfully set time with DST=%s, offset=%d min",
-                                manager.mac_address, dst_enabled, tz_offset)
-
-                    # Notify only datetime sensor to update
-                    async_dispatcher_send(hass, f"ensto_datetime_update_{manager.mac_address}")
-                else:
-                    _LOGGER.error("Action [Set Device Time] for [%s]: failed to set time", manager.mac_address)
 
         async def get_calendar_day(call: ServiceCall) -> None:
                     """Get calendar day programs service."""
                     # Get device_id from target
                     device_ids = call.data.get("target", [])
                     if not device_ids:
-                        _LOGGER.error("Action [Get Calendar Day]: no target device specified")
-                        return
+                        raise ServiceValidationError("No target device specified")
 
                     if not isinstance(device_ids, list):
                         device_ids = [device_ids]
@@ -198,12 +116,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
                         device_entry = device_registry.async_get(device_id)
 
                         if not device_entry:
-                            _LOGGER.error("Action [Get Calendar Day %d]: device not found %s", day, device_id)
-                            continue
+                            raise ServiceValidationError(f"Device {device_id} not found")
 
-                        # Get config entry from device
-                        config_entry_id = next(iter(device_entry.config_entries))
+                        # Get config entry from device (config_entry_id exists from Home Assistant 2026.8)
+                        config_entry_id = getattr(device_entry, "config_entry_id", None) or next(iter(device_entry.config_entries))
                         config_entry = hass.config_entries.async_get_entry(config_entry_id)
+                        if config_entry is None or config_entry.state is not ConfigEntryState.LOADED:
+                            raise ServiceValidationError(f"Device {device_id} is disabled or not available")
                         manager = config_entry.runtime_data
 
                         # Read calendar day
@@ -213,18 +132,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
                             enabled_programs = [p for p in result['programs'] if p['enabled']]
                             programs_str = ", ".join([f"{p['start_hour']:02d}:{p['start_minute']:02d}-{p['end_hour']:02d}:{p['end_minute']:02d} {p['temp_offset']:+.1f}°C" for p in enabled_programs])
                             _LOGGER.info("Action [Get Calendar Day %d] for [%s] (%s): %d programs [%s]",
-                                    day, manager.device_name or "Unknown", manager.mac_address, len(enabled_programs), programs_str)
+                                    day, manager.device_name or "Unknown Device", manager.mac_address, len(enabled_programs), programs_str)
                         else:
-                            _LOGGER.error("Action [Get Calendar Day %d] for [%s] (%s): failed to read", 
-                                    day, manager.device_name or "Unknown", manager.mac_address)
+                            raise HomeAssistantError(f"Could not read calendar day from {manager.device_name or manager.mac_address}")
 
         async def set_calendar_day(call: ServiceCall) -> None:
                     """Set calendar day programs service."""
                     # Get device_id from target
                     device_ids = call.data.get("target", [])
                     if not device_ids:
-                        _LOGGER.error("Action [Set Calendar Day]: no target device specified")
-                        return
+                        raise ServiceValidationError("No target device specified")
 
                     if not isinstance(device_ids, list):
                         device_ids = [device_ids]
@@ -238,12 +155,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
                         device_entry = device_registry.async_get(device_id)
 
                         if not device_entry:
-                            _LOGGER.error("Action [Set Calendar Day %d]: device not found %s", day, device_id)
-                            continue
+                            raise ServiceValidationError(f"Device {device_id} not found")
 
-                        # Get config entry from device
-                        config_entry_id = next(iter(device_entry.config_entries))
+                        # Get config entry from device (config_entry_id exists from Home Assistant 2026.8)
+                        config_entry_id = getattr(device_entry, "config_entry_id", None) or next(iter(device_entry.config_entries))
                         config_entry = hass.config_entries.async_get_entry(config_entry_id)
+                        if config_entry is None or config_entry.state is not ConfigEntryState.LOADED:
+                            raise ServiceValidationError(f"Device {device_id} is disabled or not available")
                         manager = config_entry.runtime_data
 
                         # Write calendar day
@@ -253,19 +171,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
                             enabled_programs = [p for p in programs if p['enabled']]
                             programs_str = ", ".join([f"{p['start_hour']:02d}:{p['start_minute']:02d}-{p['end_hour']:02d}:{p['end_minute']:02d} {p['temp_offset']:+.1f}°C" for p in enabled_programs])
                             _LOGGER.info("Action [Set Calendar Day %d] for [%s] (%s): %d programs saved [%s]",
-                                    day, manager.device_name or "Unknown", manager.mac_address, len(enabled_programs), programs_str)
+                                    day, manager.device_name or "Unknown Device", manager.mac_address, len(enabled_programs), programs_str)
                         else:
-                            _LOGGER.error("Action [Set Calendar Day %d] for [%s] (%s): failed to write", 
-                                    day, manager.device_name or "Unknown", manager.mac_address)
+                            raise HomeAssistantError(f"Could not write calendar day to {manager.device_name or manager.mac_address}")
 
         # Only register services if they don't already exist
-        if not hass.services.has_service(DOMAIN, SERVICE_SET_TIME):
-            hass.services.async_register(
-                DOMAIN,
-                SERVICE_SET_TIME,
-                set_device_time,
-            )
-
         if not hass.services.has_service(DOMAIN, SERVICE_GET_CALENDAR_DAY):
             hass.services.async_register(
                 DOMAIN,
@@ -289,6 +199,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         
     except Exception as ex:
         _LOGGER.error("Error setting up Ensto BLE: %s", str(ex))
+        # Close the connection so the device can be reached on the next attempt
+        if manager is not None:
+            await manager.cleanup()
         raise ConfigEntryNotReady from ex
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> bool:
@@ -305,7 +218,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> bo
         if e.entry_id != entry.entry_id
     ]
     if not remaining_entries:
-        hass.services.async_remove(DOMAIN, SERVICE_SET_TIME)
         hass.services.async_remove(DOMAIN, SERVICE_GET_CALENDAR_DAY)
         hass.services.async_remove(DOMAIN, SERVICE_SET_CALENDAR_DAY)
 
