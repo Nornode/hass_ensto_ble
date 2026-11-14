@@ -17,6 +17,9 @@ Thumbs.db
 venv/
 ENV/
 
+# Test caches
+.pytest_cache/
+
 # Local development scripts and scratch files
 scripts/
 *.local.*
