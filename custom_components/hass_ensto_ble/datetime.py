@@ -17,6 +17,9 @@ from . import EnstoConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
+PARALLEL_UPDATES = 1
+SCAN_INTERVAL = timedelta(seconds=30)
+
 async def async_setup_entry(
     hass: HomeAssistant, # Home Assistant instance
     entry: EnstoConfigEntry, # Config entry containing device info like MAC address

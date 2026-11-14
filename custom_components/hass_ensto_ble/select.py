@@ -1,5 +1,6 @@
 """Support for Ensto BLE selects."""
 import logging
+from datetime import timedelta
 from typing import Optional
 
 from homeassistant.components.select import SelectEntity
@@ -7,9 +8,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
 
-from .base_entity import EnstoBaseEntity
+from .base_entity import EnstoCoordinatorEntity, EnstoConfigEntity
 from .const import (
-    SCAN_INTERVAL,
     FLOOR_SENSOR_CONFIG, MODE_MAP, SUPPORTED_MODES_ECO16, SUPPORTED_MODES_ELTE6,
     EXTERNAL_CONTROL_MODES,
 )
@@ -18,65 +18,52 @@ from . import EnstoConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-# Reverse mapping for easy lookup
+PARALLEL_UPDATES = 1
+SCAN_INTERVAL = timedelta(seconds=30)
+
 FLOOR_SENSOR_TYPES = {v['sensor_type']: k for k, v in FLOOR_SENSOR_CONFIG.items()}
 
 async def async_setup_entry(
-    hass: HomeAssistant, # Home Assistant instance
-    entry: EnstoConfigEntry, # Config entry containing device info like MAC address
-    async_add_entities: AddEntitiesCallback # Callback to register new entities
+    hass: HomeAssistant,
+    entry: EnstoConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up selects from a config entry."""
     manager = entry.runtime_data
+    coordinator = manager.get_real_time_coordinator()
     
-    # Always add heating mode select
-    selects = [EnstoHeatingModeSelect(manager)]
+    selects = [EnstoHeatingModeSelect(coordinator, manager)]
     
-    # Add floor sensor select only for ECO16 models
     model = manager.model_number if manager.model_number else ""
     if "ECO16" in model:
         selects.append(EnstoFloorSensorSelect(manager))
     
-    # Add external control mode select only for firmware 1.14+
     if manager.supports_external_control():
         selects.append(EnstoExternalControlModeSelect(manager))
     
-    async_add_entities(selects, True)
+    async_add_entities(selects, False)
 
-class EnstoHeatingModeSelect(EnstoBaseEntity, SelectEntity):
-    """Representation of Ensto Heating Mode select.
+class EnstoHeatingModeSelect(EnstoCoordinatorEntity, SelectEntity):
+    """Representation of Ensto Heating Mode select backed by coordinator."""
 
-    Allows selection of heating modes:
-    - Floor: Floor sensor based heating (ECO16 only)
-    - Room: Room sensor based heating
-    - Combination: Combined floor and room sensors (ECO16 only)
-    - Power: Direct power control
-    - Force Control: Manual control mode
-    """
-
-    _attr_scan_interval = SCAN_INTERVAL
-    _attr_has_entity_name = True
-
-    def __init__(self, manager):
-        """Initialize the select."""
-        super().__init__(manager)  # Call parent class __init__
+    def __init__(self, coordinator, manager):
+        super().__init__(coordinator, manager)
         self._attr_name = "Heating mode"
         self._attr_unique_id = f"{dr.format_mac(self._manager.mac_address)}_heating_mode_select"
-        self._current_mode = None
         self._available_modes = None
 
     @property
     def current_option(self) -> Optional[str]:
-        """Return current heating mode."""
-        return self._current_mode
+        """Return current heating mode directly from coordinator real-time data."""
+        if self.coordinator.data:
+            return self.coordinator.data.get("heating_mode")
+        return None
 
     @property
     def options(self) -> list[str]:
         """Return list of available heating modes."""
         if self._available_modes is None:
-            # Check device model
             model = self._manager.model_number if self._manager.model_number else ""
-            # For ELTE6, exclude "Floor" and "Combination" modes
             if "ELTE6" in model:
                 allowed_numbers = SUPPORTED_MODES_ELTE6
             else:
@@ -86,44 +73,34 @@ class EnstoHeatingModeSelect(EnstoBaseEntity, SelectEntity):
         return self._available_modes
 
     async def async_select_option(self, option: str) -> None:
-        """
-        Change heating mode on the device.
-        Args:
-            option: One of "Floor", "Room", "Combination", "Power", "Force Control"
-        """
-        # Find mode number by name
+        """Change heating mode on the device."""
         mode_number = next(num for num, name in MODE_MAP.items() if name == option)
-        await self._manager.write_heating_mode(mode_number)
-        self._current_mode = option
+        success = await self._manager.write_heating_mode(mode_number)
+        if success:
+            if self.coordinator.data:
+                self.coordinator.data["heating_mode"] = option
+            self._manager.config_data["heating_mode"] = {"mode_number": mode_number, "mode_name": option}
+            self.async_write_ha_state()
+            await self.coordinator.async_request_refresh()
 
-    async def async_update(self) -> None:
-        """Update heating mode."""
-        try:
-            result = await self._manager.read_heating_mode()
-            if result:
-                mode_number = result['mode_number']
-                if mode_number in MODE_MAP:
-                    self._current_mode = MODE_MAP[mode_number]
-        except Exception as e:
-            _LOGGER.error("Error updating heating mode: %s", e)
-
-class EnstoFloorSensorSelect(EnstoBaseEntity, SelectEntity):
+class EnstoFloorSensorSelect(EnstoConfigEntity, SelectEntity):
     """Representation of Ensto Floor Sensor Type select."""
 
-    _attr_scan_interval = SCAN_INTERVAL
-    _attr_has_entity_name = True
-
     def __init__(self, manager):
-        """Initialize the select."""
         super().__init__(manager)
         self._attr_name = "Floor sensor type"
         self._attr_unique_id = f"{dr.format_mac(self._manager.mac_address)}_floor_sensor_select"
-        self._current_type = None
 
     @property
     def current_option(self) -> Optional[str]:
-        """Return current floor sensor type."""
-        return self._current_type
+        """Return current floor sensor type from config cache."""
+        fs = self._manager.config_data.get("floor_sensor_type")
+        if fs:
+            sensor_type = fs.get("sensor_type")
+            for name, cfg in FLOOR_SENSOR_CONFIG.items():
+                if cfg["sensor_type"] == sensor_type:
+                    return name
+        return None
 
     @property
     def options(self) -> list[str]:
@@ -131,112 +108,62 @@ class EnstoFloorSensorSelect(EnstoBaseEntity, SelectEntity):
         return list(FLOOR_SENSOR_CONFIG.keys())
 
     async def async_select_option(self, option: str) -> None:
-       """Change floor sensor type."""
-       try:
-           if option in FLOOR_SENSOR_CONFIG:
-               # Write configuration to device
-               if await self._manager.write_floor_sensor_config(FLOOR_SENSOR_CONFIG[option]):
-                   # Log successful configuration change
-                   _LOGGER.debug(
-                       "Floor sensor configuration successfully changed."
-                   )
-
-                   self._current_type = option
-
-       except Exception as e:
-           _LOGGER.error("Error setting floor sensor type: %s", e)
-
-    async def async_update(self) -> None:
-        """Update floor sensor type."""
+        """Change floor sensor type."""
         try:
-            config = await self._manager.read_floor_sensor_config()
-            if config:
-                sensor_type = config['sensor_type']
-                sensor_missing_limit = config['sensor_missing_limit']
-                sensor_broken_limit = config['sensor_broken_limit']
-                resistance_25c = config['resistance_25c']
-                offset = config['offset']
-
-                # Log all values in debug
-                _LOGGER.debug(
-                    "Updated %s Floor Sensor for %s: type=%s, resistance=%s, offset=%.1f°C, adc_limits=%d-%d",
-                    self._manager.device_name or "Unknown Device",
-                    self._manager.mac_address,
-                    FLOOR_SENSOR_TYPES.get(sensor_type, 'Unknown'),
-                    f"{resistance_25c//1000} kΩ" if resistance_25c >= 1000 else f"{resistance_25c}",
-                    offset,
-                    sensor_broken_limit,
-                    sensor_missing_limit
-                )
-
-                # Convert sensor type number to string representation
-                for name, config in FLOOR_SENSOR_CONFIG.items():
-                    if config['sensor_type'] == sensor_type:
-                        self._current_type = name
-                        break
-                
+            if option in FLOOR_SENSOR_CONFIG:
+                success = await self._manager.write_floor_sensor_config(FLOOR_SENSOR_CONFIG[option])
+                if success:
+                    self._manager.config_data["floor_sensor_type"] = {
+                        "sensor_type": FLOOR_SENSOR_CONFIG[option]["sensor_type"]
+                    }
+                    self.async_write_ha_state()
+                    if self._manager.coordinator:
+                        await self._manager.coordinator.async_request_refresh()
         except Exception as e:
-            _LOGGER.error("Error updating floor sensor type: %s", e)
+            _LOGGER.error("Error setting floor sensor type: %s", e)
 
-class EnstoExternalControlModeSelect(EnstoBaseEntity, SelectEntity):
-    """Select entity for external control mode.
-
-    Allows selecting between:
-    - Off: External control disabled (mode 2)
-    - Temperature: Set absolute target temperature (mode 5)
-    - Temperature change: Set offset from normal target (mode 6)
-    """
-
-    _attr_scan_interval = SCAN_INTERVAL
-    _attr_has_entity_name = True
+class EnstoExternalControlModeSelect(EnstoConfigEntity, SelectEntity):
+    """Select entity for external control mode."""
 
     def __init__(self, manager):
-        """Initialize the select."""
         super().__init__(manager)
         self._attr_name = "External control mode"
         self._attr_unique_id = f"{dr.format_mac(self._manager.mac_address)}_external_control_mode"
         self._attr_icon = "mdi:thermostat"
         self._attr_options = list(EXTERNAL_CONTROL_MODES.values())
-        self._attr_current_option = None
 
     @property
     def current_option(self) -> Optional[str]:
-        """Return current mode."""
-        return self._attr_current_option
+        """Return current mode from config cache."""
+        fc = self._manager.config_data.get("force_control")
+        if fc:
+            return fc.get("mode_name", "Off")
+        return "Off"
 
     @property
     def available(self) -> bool:
-        """Return if entity is available.
-        
-        Entity is available when device is available and firmware supports external control.
-        Mode selector must be accessible to switch between Off/Temperature/Temperature change.
-        """
+        """Return if entity is available."""
         return super().available
 
     async def async_select_option(self, option: str) -> None:
         """Change external control mode."""
         try:
-            current = await self._manager.read_force_control()
+            current = self._manager.config_data.get("force_control") or await self._manager.read_force_control()
             if current:
-                # Find mode number by name
                 mode = next(
                     num for num, name in EXTERNAL_CONTROL_MODES.items() 
                     if name == option
                 )
                 await self._manager.write_force_control(
                     mode=mode,
-                    temperature=current['temperature'],
-                    temperature_offset=current['temperature_offset']
+                    temperature=current.get('temperature', 20.0),
+                    temperature_offset=current.get('temperature_offset', 0.0)
                 )
-                self._attr_current_option = option
+                current["mode"] = mode
+                current["mode_name"] = option
+                self._manager.config_data["force_control"] = current
+                self.async_write_ha_state()
+                if self._manager.coordinator:
+                    await self._manager.coordinator.async_request_refresh()
         except Exception as e:
             _LOGGER.error("Failed to set external control mode: %s", e)
-
-    async def async_update(self) -> None:
-        """Update external control mode."""
-        try:
-            result = await self._manager.read_force_control()
-            if result:
-                self._attr_current_option = result.get('mode_name', 'Off')
-        except Exception as e:
-            _LOGGER.error("Error updating external control mode: %s", e)

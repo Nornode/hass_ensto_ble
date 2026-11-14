@@ -24,7 +24,14 @@ _LOGGER = logging.getLogger(__name__)
 type EnstoConfigEntry = ConfigEntry[EnstoThermostatManager]
 
 # List of supported platforms for this integration
-PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.SELECT, Platform.NUMBER, Platform.DATETIME]
+PLATFORMS = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.SELECT,
+    Platform.NUMBER,
+    Platform.DATETIME,
+]
 
 # Set services
 SERVICE_GET_CALENDAR_DAY = "get_calendar_day"
@@ -66,7 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         
         # Setup scanner and verify connection
         manager.setup()
-        await manager.ensure_connection()
+        await manager.ensure_connection(force=True)
         
         # Store the manager instance in runtime_data
         entry.runtime_data = manager
@@ -75,9 +82,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnstoConfigEntry) -> boo
         manager.sw_version = await manager.read_software_revision()
         manager.hw_version = await manager.read_hardware_revision()
 
-        # Sensors are created from the first real-time data, so retry setup until it can be read
-        if await manager.get_real_time_coordinator().get_real_time_data() is None:
-            raise Exception("Could not read real-time data")
+        # Initialize coordinator and perform initial refresh
+        coordinator = manager.get_real_time_coordinator()
+        await coordinator.async_config_entry_first_refresh()
 
         # Update config entry title with current info
         title = f"{manager.model_number or 'Unknown Model'} {manager.device_name or entry.data['mac_address']}"

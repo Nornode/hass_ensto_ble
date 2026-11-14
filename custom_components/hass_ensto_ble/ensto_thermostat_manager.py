@@ -77,15 +77,33 @@ class EnstoThermostatManager:
         self.storage_manager = EnstoStorageManager(hass)
         self.model_number = None
         self.device_name = None
-        self.real_time_coordinator = None
+        self.coordinator = None
+        self.config_data = {
+            "boost": None,
+            "heating_mode": None,
+            "adaptive_temp": None,
+            "daylight_saving": None,
+            "floor_limits": None,
+            "floor_sensor_type": None,
+            "calibration": None,
+            "heating_power": None,
+            "floor_area": None,
+            "energy_unit": None,
+            "vacation_time": None,
+            "calendar_mode": None,
+            "force_control": None,
+        }
         self.connected_at: Optional[float] = None
         # True once the Factory Reset ID is written; reads and writes before that
         # return dummy values or drop the connection (spec 1.1.4, 1.1.5)
         self._authenticated = False
+        self._has_connected_once: bool = False
         # Failed connection still to be closed, so the adapter or proxy releases it
         self._stale_client: Optional[BleakClient] = None
         # Monotonic time of the last failed clock sync, None after a success
         self._clock_sync_failed_at: Optional[float] = None
+        self._failed_connect_count: int = 0
+        self._reconnect_backoff_until: float = 0.0
 
     @property
     def available(self) -> bool:
@@ -99,9 +117,79 @@ class EnstoThermostatManager:
         return True
 
     def get_real_time_coordinator(self):
-        if not self.real_time_coordinator:
-            self.real_time_coordinator = EnstoRealTimeCoordinator(self)
-        return self.real_time_coordinator
+        if not self.coordinator:
+            self.coordinator = EnstoRealTimeCoordinator(self.hass, self)
+        return self.coordinator
+
+    async def async_refresh_config_cache(self) -> None:
+        """Refresh all slow-changing configuration settings from the device."""
+        if not self._authenticated or not self.client or not self.client.is_connected:
+            return
+
+        model = self.model_number or ""
+        is_eco16 = "ECO16" in model
+        supports_ext = self.supports_external_control()
+
+        try:
+            boost = await self.read_boost()
+            if boost:
+                self.config_data["boost"] = boost
+
+            h_mode = await self.read_heating_mode()
+            if h_mode is not None:
+                self.config_data["heating_mode"] = h_mode
+
+            adaptive = await self.read_adaptive_temperature_control()
+            if adaptive is not None:
+                self.config_data["adaptive_temp"] = adaptive
+
+            dst = await self.read_daylight_saving()
+            if dst:
+                self.config_data["daylight_saving"] = dst
+
+            calib = await self.read_calibration_value_for_room_temperature()
+            if calib is not None:
+                self.config_data["calibration"] = calib
+
+            h_power = await self.read_heating_power()
+            if h_power:
+                self.config_data["heating_power"] = h_power
+
+            e_unit = await self.read_energy_unit_and_currency()
+            if e_unit:
+                self.config_data["energy_unit"] = e_unit
+
+            vac = await self.read_vacation_time()
+            if vac:
+                self.config_data["vacation_time"] = vac
+
+            cal_mode = await self.read_calendar_mode()
+            if cal_mode is not None:
+                self.config_data["calendar_mode"] = cal_mode
+
+            if is_eco16:
+                fl = await self.read_floor_limits()
+                if fl:
+                    self.config_data["floor_limits"] = fl
+
+                fs = await self.read_floor_sensor_type()
+                if fs:
+                    self.config_data["floor_sensor_type"] = fs
+
+                fa = await self.read_floor_area()
+                if fa:
+                    self.config_data["floor_area"] = fa
+
+            if supports_ext:
+                fc = await self.read_force_control()
+                if fc:
+                    self.config_data["force_control"] = fc
+
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+            async_dispatcher_send(self.hass, f"ensto_config_updated_{self.mac_address}")
+            _LOGGER.debug("Configuration cache refreshed for %s", self.mac_address)
+        except Exception as e:
+            _LOGGER.warning("Error refreshing configuration cache for %s: %s", self.mac_address, e)
 
     def supports_external_control(self) -> bool:
         """Check if firmware supports external control (1.14+)."""
@@ -155,8 +243,9 @@ class EnstoThermostatManager:
                 devices_list = list(devices_iter) if devices_iter else []
                 
                 device = None
+                log_adapter = _LOGGER.info if not self._has_connected_once else _LOGGER.debug
                 if devices_list:
-                    _LOGGER.info("Found %d adapters for %s:", len(devices_list), self.mac_address)
+                    log_adapter("Found %d adapters for %s:", len(devices_list), self.mac_address)
                     for d in devices_list:
                         rssi = getattr(d.advertisement, 'rssi', 'unknown') if hasattr(d, 'advertisement') else 'unknown'
                         details = getattr(d.ble_device, 'details', None)
@@ -164,7 +253,7 @@ class EnstoThermostatManager:
                             src = details.get('source', details.get('path', str(details)))
                         else:
                             src = getattr(details, 'source', str(type(details)))
-                        _LOGGER.info(" - Available Adapter: %s (RSSI: %s)", src, rssi)
+                        log_adapter(" - Available Adapter: %s (RSSI: %s)", src, rssi)
                         
                     # Sort devices by RSSI (highest/best signal first)
                     devices_list.sort(key=lambda d: getattr(d.advertisement, 'rssi', -100) if hasattr(d, 'advertisement') else -100, reverse=True)
@@ -183,19 +272,19 @@ class EnstoThermostatManager:
                                     src = getattr(details, 'source', str(type(details)))
                                 if src == self.adapter_source:
                                     device = d.ble_device
-                                    _LOGGER.info("Forced Bluetooth adapter %s for %s based on user config", src, self.mac_address)
+                                    log_adapter("Forced Bluetooth adapter %s for %s based on user config", src, self.mac_address)
                                     break
                     
                     if not device:
                         device = devices_list[0].ble_device
                         best_rssi = getattr(devices_list[0].advertisement, 'rssi', 'unknown') if hasattr(devices_list[0], 'advertisement') else 'unknown'
-                        _LOGGER.info("Selected best available adapter for %s based on RSSI (%s dBm)", self.mac_address, best_rssi)
+                        log_adapter("Selected best available adapter for %s based on RSSI (%s dBm)", self.mac_address, best_rssi)
 
                 if not device:
                     device = bluetooth.async_ble_device_from_address(self.hass, self.mac_address)
                     if device:
                         adapter_source = getattr(device.details, 'source', str(type(device.details))) if hasattr(device, 'details') else "Unknown"
-                        _LOGGER.info("Fallback selected Bluetooth adapter for %s is: %s", self.mac_address, adapter_source)
+                        log_adapter("Fallback selected Bluetooth adapter for %s is: %s", self.mac_address, adapter_source)
                 
                 if not device:
                     if getattr(self, 'adapter_source', 'auto') != 'auto':
@@ -206,9 +295,21 @@ class EnstoThermostatManager:
                 # Block _ble_read/_ble_write until the new connection is authenticated
                 self._authenticated = False
 
+                def _get_ble_device():
+                    return (
+                        bluetooth.async_ble_device_from_address(self.hass, self.mac_address, connectable=True)
+                        or bluetooth.async_ble_device_from_address(self.hass, self.mac_address)
+                    )
+
                 # Use bleak-retry-connector
                 _LOGGER.debug("Device [%s]: establishing connection", self.mac_address)
-                self.client = await establish_connection(BleakClientWithServiceCache, device, self.mac_address)
+                self.client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    device,
+                    self.mac_address,
+                    disconnected_callback=self._on_disconnected,
+                    ble_device_callback=_get_ble_device,
+                )
                 _LOGGER.debug("Device [%s]: connection established", self.mac_address)
 
                 # always pair to set encryption with unpair fallback on auth/pairing failure
@@ -221,10 +322,14 @@ class EnstoThermostatManager:
                     if any(x in err_msg for x in ("Authentication", "AuthenticationFailed", "error: 82", "Pairing failed")):
                         _LOGGER.warning("Pairing/auth failed (%s). Attempting unpair and retry...", e)
                         try:
-                            await self.client.unpair()
-                            await asyncio.sleep(2)
-                            await self.client.pair()
-                            _LOGGER.debug("Successfully paired after unpairing: %s", self.mac_address)
+                            if self.client and self.client.is_connected:
+                                await self.client.unpair()
+                                await asyncio.sleep(2)
+                                await self.client.pair()
+                                _LOGGER.debug("Successfully paired after unpairing: %s", self.mac_address)
+                            else:
+                                _LOGGER.warning("Cannot unpair %s: client is not connected", self.mac_address)
+                                raise e
                         except Exception as unpair_e:
                             _LOGGER.error("Failed to unpair/repair: %s", unpair_e)
                             raise e
@@ -261,9 +366,20 @@ class EnstoThermostatManager:
                 
                 _LOGGER.info("Successfully verified Factory Reset ID and read model number")
                 self.connected_at = time.monotonic()
+                self._has_connected_once = True
+                self._failed_connect_count = 0
+                self._reconnect_backoff_until = 0.0
 
             except Exception as e:
-                _LOGGER.error("Failed to connect: %s", str(e))
+                import random
+                self._failed_connect_count += 1
+                base_backoff = min(120.0, 5.0 * (2 ** min(self._failed_connect_count - 1, 5)))
+                jitter = random.uniform(0, 5.0)
+                self._reconnect_backoff_until = time.monotonic() + base_backoff + jitter
+                _LOGGER.error(
+                    "Failed to connect to %s: %s (attempt %d, backing off for %.1fs)",
+                    self.mac_address, str(e), self._failed_connect_count, base_backoff + jitter
+                )
                 if self.client is not None:
                     self._stale_client = self.client
                 self.client = None
@@ -273,13 +389,32 @@ class EnstoThermostatManager:
         else:
             raise Exception("Already connecting")
 
-    async def ensure_connection(self) -> None:
-        """Ensure that we have a connection to the device."""
-        if not self.client or not self.client.is_connected:
-            await self.connect()
+    def _on_disconnected(self, client: BleakClient) -> None:
+        """Handle disconnection event from bleak/proxy."""
+        _LOGGER.debug("Device %s disconnected", self.mac_address)
+        self._authenticated = False
+        self._drop_client(client)
+
+    async def ensure_connection(self, force: bool = False) -> None:
+        """Ensure that we have a connection to the device.
+        
+        Args:
+            force: If True, ignore any active reconnect backoff cooldown.
+        """
+        if self.client and self.client.is_connected and self._authenticated:
+            return
+
+        now = time.monotonic()
+        if not force and now < self._reconnect_backoff_until:
+            wait_sec = self._reconnect_backoff_until - now
+            raise BleakError(
+                f"Connection backoff active for {self.mac_address} ({wait_sec:.1f}s remaining, {self._failed_connect_count} consecutive failures)"
+            )
+
+        await self.connect()
 
     async def _ble_read(self, uuid: str, label: str = "") -> Optional[bytes]:
-        """Read a single GATT characteristic.
+        """Read a single GATT characteristic under the GATT lock.
 
         Not suitable for split-packet characteristics; use _ble_read_split() for those.
 
@@ -291,6 +426,11 @@ class EnstoThermostatManager:
         Returns:
             Raw bytes from the characteristic, or None on any failure.
         """
+        async with self._gatt_lock:
+            return await self._ble_read_unlocked(uuid, label)
+
+    async def _ble_read_unlocked(self, uuid: str, label: str = "") -> Optional[bytes]:
+        """Internal unlocked implementation of single GATT read."""
         name = label or uuid
         client = self.client
 
@@ -313,7 +453,7 @@ class EnstoThermostatManager:
             return None
 
     async def _ble_write(self, uuid: str, data: bytes | bytearray, label: str = "") -> bool:
-        """Write a single GATT characteristic with response=True.
+        """Write a single GATT characteristic with response=True under the GATT lock.
 
         Not suitable for split-packet characteristics; use _ble_write_split() for those.
 
@@ -326,6 +466,11 @@ class EnstoThermostatManager:
         Returns:
             True on success, False on any failure.
         """
+        async with self._gatt_lock:
+            return await self._ble_write_unlocked(uuid, data, label)
+
+    async def _ble_write_unlocked(self, uuid: str, data: bytes | bytearray, label: str = "") -> bool:
+        """Internal unlocked implementation of single GATT write."""
         name = label or uuid
         client = self.client
 
@@ -442,7 +587,7 @@ class EnstoThermostatManager:
         """Internal unlocked implementation of split read.
 
         Each packet starts with a header byte; bit 0x40 marks the last packet.
-        Packets are read with _ble_read(), so connection checks and BLE error
+        Packets are read with _ble_read_unlocked(), so connection checks and BLE error
         handling are the same as for single reads.
 
         Args:
@@ -456,7 +601,7 @@ class EnstoThermostatManager:
         combined = bytearray()
 
         for _ in range(MAX_SPLIT_PACKETS):
-            packet = await self._ble_read(uuid, label)
+            packet = await self._ble_read_unlocked(uuid, label)
             if packet is None:
                 return None
             if not packet:
@@ -484,7 +629,7 @@ class EnstoThermostatManager:
 
         The payload is always split into two halves. The first packet has
         header 0x80 and the last packet header 0x40. Packets are written with
-        _ble_write(), so connection checks and BLE error handling are the same
+        _ble_write_unlocked(), so connection checks and BLE error handling are the same
         as for single writes.
 
         Args:
@@ -504,7 +649,7 @@ class EnstoThermostatManager:
             packet = bytearray([header]) + chunk
             _LOGGER.debug("Writing %s packet %d/%d: %s", name, index, len(chunks), packet.hex())
 
-            if not await self._ble_write(uuid, packet, label):
+            if not await self._ble_write_unlocked(uuid, packet, label):
                 return False
 
             # Small delay between packets
